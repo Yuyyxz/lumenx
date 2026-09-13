@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import Any, Iterable, Iterator, Optional
 
@@ -83,6 +83,7 @@ class Ledger:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._batch_depth = 0
         self._conn = sqlite3.connect(db_path, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         # WAL：多会话读不阻塞写；synchronous=NORMAL 是 WAL 下的推荐档位
@@ -102,9 +103,20 @@ class Ledger:
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        """批量原子写：with ledger.transaction(): 内多次 update 全部成功或全部回滚。"""
-        with self._conn:
-            yield
+        """批量原子写：with ledger.transaction(): 内多次 update 全部成功或全部回滚。
+
+        sqlite3 无真嵌套事务：批量内 update() 不再各自开启连接级事务，
+        只有最外层 transaction() 持有 `with self._conn`（成功 commit / 异常 rollback）。
+        """
+        self._batch_depth += 1
+        try:
+            if self._batch_depth == 1:
+                with self._conn:
+                    yield
+            else:
+                yield
+        finally:
+            self._batch_depth -= 1
 
     # ------------------------------------------------------------------
     # 唯一写入口
@@ -137,7 +149,9 @@ class Ledger:
         - 每次实际变更追加 events 流水并刷新 updated_at；无变化则不动（幂等）。
         """
         now = _now()
-        with self._conn:
+        # 批量事务内不开自己的连接级事务（sqlite3 无嵌套事务，内层 commit 会使外层回滚失效）
+        tx = nullcontext() if self._batch_depth else self._conn
+        with tx:
             row = self._conn.execute(
                 "SELECT * FROM assets WHERE asset_id = ?", (asset_id,)
             ).fetchone()

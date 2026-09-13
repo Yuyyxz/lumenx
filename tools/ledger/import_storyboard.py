@@ -274,9 +274,13 @@ def _validate_episode(ep: dict, cards: dict, errors: list[str], warnings: list[s
 
     # 场景引用可解析：SC-xx 变体（如 SC-01b）回退到基卡并记 warning；未知 → error
     sc_refs = {sh["scene"] for sh in shots if sh["scene"]}
+    pr_refs: set[str] = set()
     for sh in shots:
         ann = sh.get("annotation", {})
         sc_refs.update(RE_SC_REF.findall(str(ann.get("Connection", ""))))
+        pr_refs.update(RE_PR_REF.findall(
+            " ".join([sh["title"], sh["brief"], " ".join(sh["narration"])]
+                     + [k["text"] for k in sh["keyframe_inserts"]])))
     for ref in sorted(sc_refs):
         if ref in cards["by_id"]:
             continue
@@ -285,6 +289,11 @@ def _validate_episode(ep: dict, cards: dict, errors: list[str], warnings: list[s
             warnings.append(f"{tag}: 场景引用 {ref} 无独立卡，回退基卡 {base}")
         else:
             errors.append(f"{tag}: 场景引用 {ref} 在场景卡中不存在")
+
+    # 道具引用可解析：未知编号 → error（道具是硬引用，打错号会烧错钱）
+    for ref in sorted(pr_refs):
+        if ref not in cards["by_id"]:
+            errors.append(f"{tag}: 道具引用 {ref} 在道具卡中不存在")
 
     # 台词说话人与资产卡对得上：卡上没有的角色按 NPC 记 warning（不判 error）
     for sh in shots:
@@ -367,6 +376,8 @@ def build_asset_rows(episodes: list[dict], cards: dict) -> tuple[list[dict], dic
                 "fingerprint": _fingerprint(
                     ep["episode"], sh["s_no"], sh["tc_raw"], sh["title"],
                     sh["shot_size"], sh["camera_move"], sh["brief"],
+                    " ".join(sh["narration"]),
+                    json.dumps(sh["dialogues"], ensure_ascii=False, sort_keys=True),
                     json.dumps(sh["annotation"], ensure_ascii=False, sort_keys=True),
                 ),
                 "cost": "0",
