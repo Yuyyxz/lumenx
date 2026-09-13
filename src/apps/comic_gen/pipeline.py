@@ -102,6 +102,7 @@ class ComicGenPipeline:
         self._kling_model = None
         self._vidu_model = None
         self._mulerouter_video_model = None
+        self._mock_video_model = None
 
         # Pre-download Demucs model in background so first dub request is fast
         self._demucs_ready = threading.Event()
@@ -3311,8 +3312,21 @@ class ComicGenPipeline:
             use_mulerouter = backend == "mulerouter" and (
                 model_name_lower.startswith("seedance")
             )
+            # T-B2：mock- 前缀 → Mock provider（无 key 期全链路回归，优先级最高）
+            use_mock = model_name_lower.startswith("mock-")
 
-            if use_mulerouter:
+            if use_mock:
+                if self._mock_video_model is None:
+                    from ...models.mock import MockModel
+                    self._mock_video_model = MockModel({})
+                video_path, _ = self._mock_video_model.generate(
+                    prompt=task.prompt,
+                    output_path=output_path,
+                    img_url=img_url,
+                    img_path=img_path,
+                    duration=task.duration,
+                )
+            elif use_mulerouter:
                 if self._mulerouter_video_model is None:
                     from ...models.mulerouter import MuleRouterVideoModel
                     self._mulerouter_video_model = MuleRouterVideoModel({})
