@@ -48,7 +48,7 @@ from .models import (
     StoryboardFrame,
     VideoTask,
 )
-from .llm import ScriptProcessor, DEFAULT_STORYBOARD_POLISH_PROMPT, DEFAULT_VIDEO_POLISH_PROMPT, DEFAULT_R2V_POLISH_PROMPT, DEFAULT_ENTITY_EXTRACTION_PROMPT, DEFAULT_STYLE_ANALYSIS_PROMPT, DEFAULT_STORYBOARD_EXTRACTION_PROMPT
+from .llm import ScriptProcessor, DEFAULT_STORYBOARD_POLISH_PROMPT, DEFAULT_VIDEO_POLISH_PROMPT, DEFAULT_R2V_POLISH_PROMPT, DEFAULT_ENTITY_EXTRACTION_PROMPT, DEFAULT_STYLE_ANALYSIS_PROMPT, DEFAULT_STORYBOARD_EXTRACTION_PROMPT, PolishError
 from ...utils.oss_utils import OSSImageUploader, sign_oss_urls_in_data
 from ...utils import setup_logging
 from fastapi.responses import JSONResponse
@@ -2053,6 +2053,10 @@ def analyze_to_storyboard(script_id: str, request: AnalyzeToStoryboardRequest):
         return signed_response(updated_script)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PolishError as e:
+        # T-B2 可靠性：分镜分析失败（含未配置 LLM）不再静默降级为 mock 帧。
+        logger.warning("analyze_to_storyboard failed: %s", e)
+        raise HTTPException(status_code=502, detail=_polish_error_response(e))
     except Exception as e:
         logger.error(f"Error in analyze_to_storyboard: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -3577,6 +3581,10 @@ async def analyze_script_for_styles(script_id: str, request: AnalyzeStyleRequest
         return {"recommendations": recommendations}
     except HTTPException:
         raise
+    except PolishError as e:
+        # T-B2 可靠性：style 分析失败不再静默降级为 mock，统一 502 + reason。
+        logger.warning("analyze_script_for_styles failed: %s", e)
+        raise HTTPException(status_code=502, detail=_polish_error_response(e))
     except Exception as e:
         import traceback
         logger.exception("An error occurred")

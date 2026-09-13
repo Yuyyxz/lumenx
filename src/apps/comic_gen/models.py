@@ -354,7 +354,14 @@ class StoryboardFrame(BaseModel):
     scene_id: str = Field(..., description="Reference to the Scene ID")
     character_ids: List[str] = Field(default_factory=list, description="List of Character IDs present in the frame")
     prop_ids: List[str] = Field(default_factory=list, description="List of Prop IDs present in the frame")
-    
+
+    # T-B2 可靠性：LLM 分镜输出中无法解析回实体表的原始引用。此前匹配失败
+    # 会被静默丢弃或兜底到第一个场景；现在记 warning 日志并把 LLM 原文保留
+    # 在这里（不做归一化），供前端提示与人工修复。
+    unresolved_scene_ref: Optional[str] = Field(None, description="原始场景名：未能匹配到任何已提取 Scene（帧已兜底到第一个场景或占位 ID）")
+    unresolved_character_refs: List[str] = Field(default_factory=list, description="原始角色名列表：未能匹配到任何已提取 Character")
+    unresolved_prop_refs: List[str] = Field(default_factory=list, description="原始道具名列表：未能匹配到任何已提取 Prop")
+
     # Legacy fields (kept for compatibility)
     action_description: str = Field("", description="What is happening in this frame (Legacy, use character_acting)")
     facial_expression: Optional[str] = Field(None, description="Specific facial expression")

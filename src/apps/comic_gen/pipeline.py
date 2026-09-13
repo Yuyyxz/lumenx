@@ -1376,14 +1376,29 @@ class ComicGenPipeline:
                 if scene.name == scene_ref_name or scene_ref_name in scene.name:
                     scene_id = scene.id
                     break
-            if not scene_id and all_scenes:
-                scene_id = all_scenes[0].id  # Fallback to first scene
-            elif not scene_id:
-                scene_id = str(uuid.uuid4())  # Generate a placeholder ID
+            unresolved_scene_ref = None
+            if not scene_id:
+                # T-B2 可靠性：兜底不再无声——记 warning 并在帧上保留 LLM 原始场景名
+                unresolved_scene_ref = scene_ref_name or None
+                if all_scenes:
+                    scene_id = all_scenes[0].id  # Fallback to first scene
+                    logger.warning(
+                        "[analyze_text_to_frames] 场景名 '%s' 无法匹配任何已提取场景，"
+                        "帧兜底到第一个场景 '%s'（原始引用已记录在 unresolved_scene_ref）",
+                        scene_ref_name, all_scenes[0].name,
+                    )
+                else:
+                    scene_id = str(uuid.uuid4())  # Generate a placeholder ID
+                    logger.warning(
+                        "[analyze_text_to_frames] 场景名 '%s' 无法匹配且项目无任何场景，"
+                        "使用占位 scene_id（原始引用已记录在 unresolved_scene_ref）",
+                        scene_ref_name,
+                    )
 
             # Resolve character IDs by names (case-insensitive, bidirectional contains)
             char_ref_names = frame_data.get("character_ref_names", [])
             character_ids = []
+            unresolved_character_refs = []
             for char_name in char_ref_names:
                 cn = char_name.strip().lower()
                 for char in all_characters:
@@ -1391,10 +1406,19 @@ class ComicGenPipeline:
                     if cname == cn or cn in cname or cname in cn:
                         character_ids.append(char.id)
                         break
+                else:
+                    # T-B2 可靠性：匹配失败不再静默丢弃——保留原始引用 + warning
+                    unresolved_character_refs.append(char_name)
+                    logger.warning(
+                        "[analyze_text_to_frames] 角色名 '%s' 无法匹配任何已提取角色，"
+                        "已记录在 unresolved_character_refs（帧 %d）",
+                        char_name, idx,
+                    )
 
             # Resolve prop IDs by names (case-insensitive, bidirectional contains)
             prop_ref_names = frame_data.get("prop_ref_names", [])
             prop_ids = []
+            unresolved_prop_refs = []
             for prop_name in prop_ref_names:
                 pn = prop_name.strip().lower()
                 for prop in all_props:
@@ -1402,12 +1426,22 @@ class ComicGenPipeline:
                     if pname == pn or pn in pname or pname in pn:
                         prop_ids.append(prop.id)
                         break
-            
+                else:
+                    unresolved_prop_refs.append(prop_name)
+                    logger.warning(
+                        "[analyze_text_to_frames] 道具名 '%s' 无法匹配任何已提取道具，"
+                        "已记录在 unresolved_prop_refs（帧 %d）",
+                        prop_name, idx,
+                    )
+
             frame = StoryboardFrame(
                 id=str(uuid.uuid4()),
                 scene_id=scene_id,
                 character_ids=character_ids,
                 prop_ids=prop_ids,
+                unresolved_scene_ref=unresolved_scene_ref,
+                unresolved_character_refs=unresolved_character_refs,
+                unresolved_prop_refs=unresolved_prop_refs,
                 action_description=frame_data.get("action_summary", frame_data.get("action_description", "")),
                 visual_atmosphere=frame_data.get("visual_atmosphere"),
                 shot_size=frame_data.get("shot_size"),

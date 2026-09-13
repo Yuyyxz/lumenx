@@ -789,11 +789,16 @@ class ScriptProcessor:
         """
         
         logger.info("Analyzing script for visual style recommendations...")
-        
+
         if not self.is_configured:
-            logger.warning("DASHSCOPE_API_KEY not set. Returning default recommendations.")
-            return self._mock_style_recommendations()
-        
+            # T-B2 可靠性：不再静默返回 mock 推荐（用户会误以为拿到了真实分析）。
+            logger.error("Style analysis requested but LLM is not configured.")
+            raise PolishError(
+                reason="is_configured_false",
+                message_zh="LLM 未配置（缺少 DASHSCOPE_API_KEY），无法进行风格分析。",
+                message_en="LLM not configured (missing DASHSCOPE_API_KEY); style analysis unavailable.",
+            )
+
         if custom_style_prompt and custom_style_prompt.strip():
             system_prompt = custom_style_prompt
         else:
@@ -893,10 +898,23 @@ class ScriptProcessor:
 
                         if not recommendations:
                             raise ValueError("Regex extraction failed")
-                    except:
-                        return self._mock_style_recommendations()
+                    except Exception:
+                        # T-B2 可靠性：JSON 抢救失败不再静默返回 mock 推荐，
+                        # 抛结构化错误让 API 层翻译成 502 + reason。
+                        raise PolishError(
+                            reason="json_parse_error",
+                            message_zh="风格分析返回的内容无法解析为 JSON（已尝试自动修复），建议重试。",
+                            message_en="Style analysis returned unparseable JSON (auto-repair attempted). Please retry.",
+                        )
 
             recommendations = data.get("recommendations", [])
+            if not recommendations:
+                logger.warning("Style analysis JSON parsed but 'recommendations' is empty")
+                raise PolishError(
+                    reason="missing_keys",
+                    message_zh="风格分析返回了空推荐列表，建议重试。",
+                    message_en="Style analysis returned an empty recommendation list. Please retry.",
+                )
 
             # Add unique IDs
             for i, rec in enumerate(recommendations):
@@ -905,42 +923,17 @@ class ScriptProcessor:
 
             return recommendations
 
+        except PolishError:
+            raise  # 结构化错误直接上抛，不要被下面的兜底改写成 api_error
         except Exception as e:
             logger.error(f"Error analyzing script for styles: {e}", exc_info=True)
-            return self._mock_style_recommendations()
-    
-    def _mock_style_recommendations(self) -> List[Dict[str, Any]]:
-        """返回默认的风格推荐"""
-        return [
-            {
-                "id": f"mock-cinematic-{str(uuid.uuid4())[:8]}",
-                "name": "Cinematic Realism",
-                "description": "电影级写实风格，专业打光",
-                "reason": "适合大多数叙事性内容，提供专业的视觉质感",
-                "positive_prompt": "cinematic, photorealistic, 8k, volumetric lighting, film grain, dramatic lighting",
-                "negative_prompt": "cartoon, anime, low quality, blurry",
-                "is_custom": False
-            },
-            {
-                "id": f"mock-anime-{str(uuid.uuid4())[:8]}",
-                "name": "Anime Style",
-                "description": "日式动漫风格，明快色彩",
-                "reason": "适合充满情感表现的故事",
-                "positive_prompt": "anime style, cel shading, vibrant colors, expressive, detailed character design",
-                "negative_prompt": "photorealistic, 3d, blurry, washed out",
-                "is_custom": False
-            },
-            {
-                "id": f"mock-noir-{str(uuid.uuid4())[:8]}",
-                "name": "Film Noir",
-                "description": "黑色电影风格，高对比度",
-                "reason": "适合悬疑、神秘题材的叙事",
-                "positive_prompt": "black and white, film noir, high contrast, dramatic shadows, moody lighting",
-                "negative_prompt": "colorful, bright, happy, modern",
-                "is_custom": False
-            }
-        ]
-    
+            # T-B2 可靠性：API/网络等失败不再静默返回 mock 推荐。
+            raise PolishError(
+                reason="api_error",
+                message_zh=f"风格分析调用失败：{e}",
+                message_en=f"Style analysis call failed: {e}",
+            ) from e
+
     def analyze_to_storyboard(self, text: str, entities_json: Dict[str, Any], custom_extraction_prompt: str = "") -> List[Dict[str, Any]]:
         """
         Analyzes script text and generates storyboard frames using Prompt B (Storyboard Director).
@@ -953,8 +946,14 @@ class ScriptProcessor:
         logger.info(f"Analyzing text to storyboard: {text[:100]}...")
         
         if not self.is_configured:
-            logger.warning("DASHSCOPE_API_KEY not set. Returning mock frames.")
-            return self._mock_storyboard_frames(text)
+            # T-B2 可靠性：不再静默返回 1 帧硬编码 mock 分镜（无 key 期用户会
+            # 误以为拿到了真实分镜结果）。
+            logger.error("Storyboard analysis requested but LLM is not configured.")
+            raise PolishError(
+                reason="is_configured_false",
+                message_zh="LLM 未配置（缺少 DASHSCOPE_API_KEY），无法生成分镜。",
+                message_en="LLM not configured (missing DASHSCOPE_API_KEY); storyboard analysis unavailable.",
+            )
         
         # Build entities context
         characters_list = entities_json.get("characters", [])
@@ -1026,24 +1025,6 @@ class ScriptProcessor:
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse storyboard analysis JSON: {e}")
             return None
-
-    def _mock_storyboard_frames(self, text: str) -> List[Dict[str, Any]]:
-        """Returns mock storyboard frames for testing when API is unavailable."""
-        return [
-            {
-                "scene_ref_name": "卧室",
-                "character_ref_names": ["叶墨"],
-                "prop_ref_names": ["手机"],
-                "visual_atmosphere": "昏暗的卧室，窗外透进冷色调月光",
-                "character_acting": "叶墨眉头紧锁，眼神迷离",
-                "key_action_physics": "手机在柜上剧烈震动",
-                "shot_size": "中景",
-                "camera_angle": "平视",
-                "camera_movement": "Static",
-                "dialogue": None,
-                "speaker": None
-            }
-        ]
 
     def refine_frame_to_rich(
         self,
