@@ -74,25 +74,34 @@ _VALID_STYLE_JSON = """
 class TestStyleAnalysisNoSilentMock:
 
     def test_bad_json_raises_polish_error_not_mock(self):
-        """失败注入：LLM 返回彻底坏掉的 JSON（修复器也救不回来）。"""
+        """失败注入：LLM 返回彻底坏掉的 JSON。
+
+        T-B2 步骤2升级后走 _structured_llm_call：坏 JSON 连重试 3 次仍
+        无法通过 schema 校验 → schema_validation_error（而不是静默 mock）。
+        """
         llm = FakeLLM(chat_impl=lambda m, **k: "这不是JSON{{{ 坏掉的输出")
         sp = _make_processor(llm)
 
         with pytest.raises(PolishError) as exc_info:
             sp.analyze_script_for_styles("剧本内容")
 
-        assert exc_info.value.reason == "json_parse_error"
+        assert exc_info.value.reason == "schema_validation_error"
+        assert len(llm.calls) == 3  # 反馈式重试确实发生
 
-    def test_truncated_json_raises_polish_error_not_mock(self):
-        """失败注入：截断的 JSON（历史上会被手写括号补丁强行闭合后静默降级）。"""
+    def test_truncated_json_recovered_by_json_repair(self):
+        """失败注入：截断的 JSON。
+
+        T-B2 步骤2：json_repair 兜底能修复截断 → 返回抢救出的部分数据
+        （不抛错、更不静默 mock）。修复后仍缺字段则会在 schema 层被拒。
+        """
         truncated = '{"recommendations": [{"name": "Cinematic Realism", "desc'
         llm = FakeLLM(chat_impl=lambda m, **k: truncated)
         sp = _make_processor(llm)
 
-        with pytest.raises(PolishError) as exc_info:
-            sp.analyze_script_for_styles("剧本内容")
+        recs = sp.analyze_script_for_styles("剧本内容")
 
-        assert exc_info.value.reason == "json_parse_error"
+        assert len(recs) == 1
+        assert recs[0]["name"] == "Cinematic Realism"
 
     def test_api_error_raises_polish_error_not_mock(self):
         """失败注入：LLM 调用本身抛错（网络/鉴权/限流）。"""

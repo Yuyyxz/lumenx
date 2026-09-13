@@ -1445,7 +1445,7 @@ class ComicGenPipeline:
                 action_description=frame_data.get("action_summary", frame_data.get("action_description", "")),
                 visual_atmosphere=frame_data.get("visual_atmosphere"),
                 shot_size=frame_data.get("shot_size"),
-                camera_angle=frame_data.get("camera_angle", "平视"),
+                camera_angle=frame_data.get("camera_angle") or "平视",
                 camera_movement=frame_data.get("camera_movement"),
                 dialogue=frame_data.get("dialogue"),
                 speaker=frame_data.get("speaker"),
