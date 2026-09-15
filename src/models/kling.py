@@ -18,11 +18,25 @@ T-B2 可靠性改造 (不改 2.0 协议语义):
 - 凭证校验 check_credentials() 走 GET /account/costs（不再烧资源包验证）
 - 轮询退避: 首查 2s，delay=min(delay*1.5, 10)+jitter（参照 framepipe 公式）;
   提交/轮询遇 1302/1303 指数退避后重试
+
+T-B3 参数层升级 (官方 2.0 媒体语义, survey V6 §2.2/§2.3 差距清单):
+- 媒体互斥三模式（构造层校验, 非法组合不发出请求, KlingError category=params）:
+  ① 单图: 仅 first_frame
+  ② 首尾帧对: first_frame + last_frame（last_frame 必须配 first_frame）
+  ③ 多图参考: 仅 reference_image 组（1..9 条, contents 条目可带 id 供 prompt @id 寻址）
+- settings.multi_shot: {"mode": "intelligent"} 或 {"mode": "custom",
+  "shots": [{prompt, duration} x1..6]}，custom 时各 shot 时长加总必须=总时长;
+  不传时不写该字段（官方"字段出现即开启"语义, 规避写死 False 的偏差风险）
+- options.watermark_info.enabled: kwargs.watermark 显式传入时才写
+- 提交路径三分法: 无媒体 → /text-to-video/{model}, 有媒体 → /image-to-video/{model}
+- 口径备注: V6 记录的模型级差异（turbo 仅 first_frame 等）为 open-connector
+  单方转述、未官方实证, 此处不做模型级硬校验以免误拒合法请求
 """
 
 import logging
 import os
 import random
+import re
 import time
 from typing import Dict, Any, Tuple, Optional
 
@@ -171,6 +185,171 @@ def _backoff_delay(attempt: int, base: float = 1.0, cap: float = 10.0) -> float:
     return delay + random.uniform(0, 0.5)
 
 
+# ---------------------------------------------------------------------------
+# T-B3 参数层: 官方 2.0 媒体互斥三模式 + multi_shot 校验（构造层, 不发请求）
+# ---------------------------------------------------------------------------
+
+# media 总数上限（first_frame/last_frame/reference_image 合计）
+KLING_MAX_MEDIA_ITEMS = 9
+# multi_shot 允许的模式与 shots 上限
+KLING_MULTI_SHOT_MODES = ("intelligent", "custom")
+KLING_MAX_SHOTS = 6
+# 官方 prompt 上限（可抄清单 #5: 序列化后 prompt ≤ 2500 字符）
+KLING_PROMPT_MAX_CHARS = 2500
+
+
+def _require_url(value, what: str) -> str:
+    """媒体输入必须是远程 URL（API 2.0 语义）; 本地文件请先上传。"""
+    if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+        raise KlingError(
+            f"Kling {what} 需要远程 URL（API 2.0 语义）; 本地文件请先上传获取 URL",
+            retryable=False,
+            category="params",
+        )
+    return value
+
+
+def _normalize_reference_images(reference_images) -> list:
+    """归一化 reference_images: str → {url}; dict → {url, reference_id?}。"""
+    normalized = []
+    for item in reference_images:
+        if isinstance(item, str):
+            normalized.append({"url": item})
+        elif isinstance(item, dict):
+            url = item.get("url")
+            ref_id = item.get("reference_id") or item.get("id")
+            entry = {"url": url}
+            if ref_id:
+                entry["reference_id"] = str(ref_id)
+            normalized.append(entry)
+        else:
+            raise KlingError(
+                "Kling reference_images 元素必须是 URL 字符串或 {url, reference_id} 字典",
+                retryable=False,
+                category="params",
+            )
+    return normalized
+
+
+def _validate_media_modes(
+    first_frame_url: Optional[str],
+    last_frame_url: Optional[str],
+    references: list,
+) -> None:
+    """官方互斥三模式校验（survey V6 §2.2 + open-connector 组合规则语义）。
+
+    ① 单图: 仅 first_frame
+    ② 首尾帧对: first_frame + last_frame
+    ③ 多图参考: 仅 reference_image 组（1..KLING_MAX_MEDIA_ITEMS 条）
+    非法组合在构造层抛 KlingError(category="params")，不发出请求。
+    """
+    has_frame = first_frame_url is not None
+    has_tail = last_frame_url is not None
+    has_refs = bool(references)
+
+    # 互斥: 多图参考与首尾帧（单图）不得混用
+    if has_refs and (has_frame or has_tail):
+        raise KlingError(
+            "Kling 媒体输入互斥: reference_images（多图参考）不能与 first_frame/last_frame 同传; "
+            "官方三模式: 单图 / 首尾帧对 / 多图参考, 三选一",
+            retryable=False,
+            category="params",
+        )
+
+    # 首尾帧对: last_frame 必须配 first_frame
+    if has_tail and not has_frame:
+        raise KlingError(
+            "Kling 媒体输入非法: last_frame 必须与 first_frame 成对出现（首尾帧对模式）",
+            retryable=False,
+            category="params",
+        )
+
+    # 多图参考条数上限（media 总数 ≤ 9）
+    if len(references) > KLING_MAX_MEDIA_ITEMS:
+        raise KlingError(
+            f"Kling 多图参考最多 {KLING_MAX_MEDIA_ITEMS} 条, 收到 {len(references)} 条",
+            retryable=False,
+            category="params",
+        )
+
+    # reference_id 唯一（prompt @id 寻址的前提）
+    ref_ids = [r["reference_id"] for r in references if r.get("reference_id")]
+    dupes = {rid for rid in ref_ids if ref_ids.count(rid) > 1}
+    if dupes:
+        raise KlingError(
+            f"Kling reference_id 必须唯一, 重复: {sorted(dupes)}",
+            retryable=False,
+            category="params",
+        )
+
+
+def _validate_multi_shot(multi_shot, total_duration: int):
+    """multi_shot 校验: intelligent 或 custom（1..6 shots, 时长加总=总时长）。
+
+    返回归一化后的 multi_shot 字典（直接写入 settings）。
+    """
+    if not isinstance(multi_shot, dict):
+        raise KlingError(
+            "Kling multi_shot 必须是 {'mode': 'intelligent'|'custom', 'shots': [...]}",
+            retryable=False,
+            category="params",
+        )
+    mode = multi_shot.get("mode")
+    if mode not in KLING_MULTI_SHOT_MODES:
+        raise KlingError(
+            f"Kling multi_shot.mode 必须是 {'/'.join(KLING_MULTI_SHOT_MODES)}, 收到 {mode!r}",
+            retryable=False,
+            category="params",
+        )
+    if mode == "custom":
+        shots = multi_shot.get("shots")
+        if not isinstance(shots, list) or not (1 <= len(shots) <= KLING_MAX_SHOTS):
+            raise KlingError(
+                f"Kling multi_shot custom 模式需要 1..{KLING_MAX_SHOTS} 个 shot, 收到 "
+                f"{len(shots) if isinstance(shots, list) else 'non-list'}",
+                retryable=False,
+                category="params",
+            )
+        total = 0
+        for idx, shot in enumerate(shots):
+            shot_duration = shot.get("duration") if isinstance(shot, dict) else None
+            if not isinstance(shot_duration, (int, float)) or shot_duration <= 0:
+                raise KlingError(
+                    f"Kling multi_shot shots[{idx}].duration 必须为正数, 收到 {shot_duration!r}",
+                    retryable=False,
+                    category="params",
+                )
+            total += shot_duration
+            shot_prompt = shot.get("prompt", "") if isinstance(shot, dict) else ""
+            if len(shot_prompt) > KLING_PROMPT_MAX_CHARS:
+                raise KlingError(
+                    f"Kling multi_shot shots[{idx}].prompt 超过 {KLING_PROMPT_MAX_CHARS} 字符上限",
+                    retryable=False,
+                    category="params",
+                )
+        if total != total_duration:
+            raise KlingError(
+                f"Kling multi_shot custom 模式各 shot 时长加总（{total}s）必须等于总时长（{total_duration}s）",
+                retryable=False,
+                category="params",
+            )
+    return multi_shot
+
+
+def _warn_unresolved_prompt_refs(prompt: str, references: list) -> None:
+    """prompt 中出现 @token 但没有一个命中 reference_id 时给 warning（不强制报错,
+    避免 @ 符号的其他用法被误伤）。"""
+    ref_ids = {r["reference_id"] for r in references if r.get("reference_id")}
+    if not ref_ids:
+        return
+    tokens = set(re.findall(r"@([\w\u4e00-\u9fff-]+)", prompt or ""))
+    if tokens and not (tokens & ref_ids):
+        logger.warning(
+            "[Kling] prompt 含 @引用 %s 但未命中任何 reference_id %s（@id 寻址将不生效）",
+            sorted(tokens), sorted(ref_ids),
+        )
+
+
 class KlingModel(VideoGenModel):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
@@ -249,16 +428,27 @@ class KlingModel(VideoGenModel):
         if img_url and img_url.startswith(("http://", "https://")):
             return img_url
         if img_path and os.path.exists(img_path):
-            # 本地文件需上传到可灵 CDN 或用 data URL。
-            # 简化: 上传逻辑可参考 utils/oss_utils, 这里先支持远程 URL。
-            raise ValueError(
-                "API 2.0 需要图片 URL; 本地文件请先上传 (可灵 CDN 或对象存储)"
+            # API 2.0 contents[].url 只收远程 URL; 本地文件需先上传（可灵 CDN / OSS）
+            raise KlingError(
+                "Kling API 2.0 需要图片 URL; 本地文件请先上传 (可灵 CDN 或对象存储)",
+                retryable=False,
+                category="params",
             )
         return img_url or ""
 
     def generate(self, prompt: str, output_path: str, img_url: str = None,
                  img_path: str = None, **kwargs) -> Tuple[str, float]:
-        """Generate video using Kling API 2.0 (T2V or I2V)."""
+        """Generate video using Kling API 2.0 (T2V / I2V / 首尾帧 / 多图参考 / multi_shot).
+
+        kwargs 媒体参数（官方 2.0 互斥三模式, 构造层校验）:
+        - tail_img_url: 尾帧 URL → 首尾帧对模式（必须与 img_url/img_path 成对）
+        - reference_images: 多图参考, 元素为 URL 或 {url, reference_id} → 多图参考模式
+          （不能与 img_url/img_path/tail_img_url 同传; ≤9 条; reference_id 唯一,
+            prompt 中 @reference_id 寻址）
+        - multi_shot: {"mode": "intelligent"} 或 {"mode": "custom",
+          "shots": [{"prompt", "duration"} × 1..6]}（custom 时长加总必须=总时长）
+        - watermark: 显式传 bool 时写 options.watermark_info.enabled
+        """
         if not self.api_key:
             raise KlingError(
                 "KLING_API_KEY 未配置",
@@ -271,39 +461,77 @@ class KlingModel(VideoGenModel):
         _res_map = {"std": "720p", "pro": "1080p", "standard": "720p"}
         mode_in = kwargs.get("mode", "pro")
         resolution = kwargs.get("resolution") or _res_map.get(mode_in, mode_in)
-        audio = kwargs.get("sound", "off")      # "on" or "off"
+        audio = kwargs.get("sound", "off")      # off / native / original
         negative_prompt = kwargs.get("negative_prompt", "")
         aspect_ratio = kwargs.get("aspect_ratio", "16:9")
         cfg_scale = kwargs.get("cfg_scale")
 
+        tail_img_url = kwargs.get("tail_img_url")
+        reference_images = kwargs.get("reference_images") or []
+        multi_shot = kwargs.get("multi_shot")
+        watermark = kwargs.get("watermark")
+
         start_time = time.time()
-        is_i2v = bool(img_url or img_path)
         base_url = get_provider_base_url("KLING")
+
+        # --- 构造层校验与归一化（非法组合在此报错, 不发出请求） ---
+        first_frame_url = None
+        if img_url or img_path:
+            first_frame_url = _require_url(
+                self._resolve_image_input(img_url, img_path), "first_frame 输入"
+            )
+        if tail_img_url:
+            last_frame_url = _require_url(tail_img_url, "last_frame 输入")
+        else:
+            last_frame_url = None
+        references = _normalize_reference_images(reference_images)
+        for ref in references:
+            _require_url(ref["url"], "reference_image 输入")
+
+        _validate_media_modes(first_frame_url, last_frame_url, references)
+        if multi_shot is not None:
+            multi_shot = _validate_multi_shot(multi_shot, duration)
+        if references:
+            _warn_unresolved_prompt_refs(prompt, references)
 
         # 组装 contents (新版)
         contents: list = [{"type": "prompt", "text": prompt}]
         if negative_prompt:
             contents.append({"type": "negative_prompt", "text": negative_prompt})
-        if is_i2v:
-            image_url = self._resolve_image_input(img_url, img_path)
-            contents.append({"type": "first_frame", "url": image_url})
+        if references:
+            # 模式③: 多图参考, contents 条目可带 id 供 prompt @id 寻址
+            for ref in references:
+                entry: Dict[str, Any] = {"type": "reference_image", "url": ref["url"]}
+                if ref.get("reference_id"):
+                    entry["id"] = ref["reference_id"]
+                contents.append(entry)
+        else:
+            # 模式①②: 单图 / 首尾帧对
+            if first_frame_url:
+                contents.append({"type": "first_frame", "url": first_frame_url})
+            if last_frame_url:
+                contents.append({"type": "last_frame", "url": last_frame_url})
 
-        # 组装 settings (新版)
+        # 组装 settings (新版); multi_shot 不传时不写该字段
+        #（官方"字段出现即开启"语义, 规避写死 False 的偏差风险）
         settings: Dict[str, Any] = {
             "resolution": resolution,
             "duration": duration,
             "audio": audio,
-            "multi_shot": False,
         }
         if cfg_scale is not None:
             settings["cfg_scale"] = cfg_scale
         if aspect_ratio:
             settings["aspect_ratio"] = aspect_ratio
+        if multi_shot is not None:
+            settings["multi_shot"] = multi_shot
 
         # options (新版, 可选)
         options: Dict[str, Any] = {}
         if kwargs.get("callback_url"):
             options["callback_url"] = kwargs["callback_url"]
+        if watermark is not None:
+            options["watermark_info"] = {"enabled": bool(watermark)}
 
         body = {
             "contents": contents,
@@ -311,10 +539,12 @@ class KlingModel(VideoGenModel):
             "options": options,
         }
 
-        # 提交任务: POST /image-to-video/{model_id}
+        # 提交任务（路径三分法）: 有媒体 → /image-to-video/{model}, 无媒体 → /text-to-video/{model}
         # 1302 限频 / 1303 超并发 / 5xxx 服务端 → 指数退避后重试（≤3 次）
-        submit_url = f"{base_url}/image-to-video/{self.model_name}"
-        logger.info(f"[Kling] Submitting {'i2v' if is_i2v else 't2v'} task (model={self.model_name})")
+        has_media = bool(references or first_frame_url or last_frame_url)
+        endpoint = "image-to-video" if has_media else "text-to-video"
+        submit_url = f"{base_url}/{endpoint}/{self.model_name}"
+        logger.info(f"[Kling] Submitting {endpoint} task (model={self.model_name})")
 
         task_id = None
         max_submit_attempts = 3
