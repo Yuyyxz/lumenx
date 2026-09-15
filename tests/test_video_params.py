@@ -112,12 +112,11 @@ class TestKlingModelParams:
     """Verify Kling adapter correctly includes new params in the request body."""
 
     def test_sound_and_cfg_scale_in_body(self, monkeypatch):
+        """2.0 请求体语义: sound→settings.audio, cfg_scale→settings.cfg_scale,
+        mode(std/pro)→settings.resolution。"""
         from src.models.kling import KlingModel
 
-        model = KlingModel({
-            "access_key": "test_ak",
-            "secret_key": "test_sk",
-        })
+        model = KlingModel({"api_key": "test-key"})
 
         captured_body = {}
 
@@ -125,37 +124,32 @@ class TestKlingModelParams:
             status_code = 200
             def raise_for_status(self): pass
             def json(self):
-                return {"code": 0, "data": {"task_id": "fake-task-id"}}
+                return {"code": 0, "data": {"id": "fake-task-id"}}
 
         def mock_post(url, headers=None, json=None, timeout=None):
             captured_body.update(json or {})
             return FakeResponse()
 
-        # 只 mock 提交阶段，让它在 poll 阶段直接报错退出
         import requests
         monkeypatch.setattr(requests, "post", mock_post)
 
-        # generate 会在 poll 阶段 sleep + get，
-        # 我们只需要验证提交的 body 包含新字段即可
         class FakePollResponse:
             status_code = 200
             def raise_for_status(self): pass
             def json(self):
                 return {
                     "code": 0,
-                    "data": {
-                        "task_status": "succeed",
-                        "task_result": {"videos": [{"url": "https://example.com/video.mp4"}]},
-                    },
+                    "data": [{
+                        "status": "succeeded",
+                        "outputs": [{"type": "video", "url": "https://example.com/video.mp4"}],
+                    }],
                 }
 
         class FakeVideoContent:
             content = b"fake video bytes"
 
-        call_count = {"n": 0}
         def mock_get(url, headers=None, timeout=None):
-            call_count["n"] += 1
-            if "image2video" in url or "text2video" in url:
+            if "/tasks" in url:
                 return FakePollResponse()
             return FakeVideoContent()
 
@@ -171,14 +165,21 @@ class TestKlingModelParams:
                 mode="pro", sound="on", cfg_scale=0.6,
             )
 
-        assert captured_body.get("sound") == "on"
-        assert captured_body.get("cfg_scale") == pytest.approx(0.6)
-        assert captured_body.get("mode") == "pro"
+        settings = captured_body["settings"]
+        assert settings.get("audio") == "on"
+        assert settings.get("cfg_scale") == pytest.approx(0.6)
+        assert settings.get("resolution") == "1080p"
+        # 2.0 三层结构: 顶层不应再有旧版扁平字段
+        assert "sound" not in captured_body
+        assert "mode" not in captured_body
+        assert "cfg_scale" not in captured_body
 
     def test_sound_omitted_when_none(self, monkeypatch):
+        """2.0 语义: 不传 sound/cfg_scale 时, settings 无 cfg_scale,
+        audio 落到显式默认 off, 顶层无旧版扁平字段。"""
         from src.models.kling import KlingModel
 
-        model = KlingModel({"access_key": "ak", "secret_key": "sk"})
+        model = KlingModel({"api_key": "test-key"})
 
         captured_body = {}
 
@@ -186,20 +187,23 @@ class TestKlingModelParams:
             status_code = 200
             def raise_for_status(self): pass
             def json(self):
-                return {"code": 0, "data": {"task_id": "t1"}}
+                return {"code": 0, "data": {"id": "t1"}}
 
         class FakePoll:
             status_code = 200
             def raise_for_status(self): pass
             def json(self):
-                return {"code": 0, "data": {"task_status": "succeed", "task_result": {"videos": [{"url": "http://x.mp4"}]}}}
+                return {"code": 0, "data": [{
+                    "status": "succeeded",
+                    "outputs": [{"type": "video", "url": "http://x.mp4"}],
+                }]}
 
         class FakeDL:
             content = b"bytes"
 
         import requests
         monkeypatch.setattr(requests, "post", lambda *a, **kw: (captured_body.update(kw.get("json", {})), FakeResponse())[1])
-        monkeypatch.setattr(requests, "get", lambda *a, **kw: FakePoll() if "image2video" in a[0] else FakeDL())
+        monkeypatch.setattr(requests, "get", lambda *a, **kw: FakePoll() if "/tasks" in a[0] else FakeDL())
         monkeypatch.setattr("time.sleep", lambda x: None)
 
         import tempfile, os
@@ -212,6 +216,9 @@ class TestKlingModelParams:
 
         assert "sound" not in captured_body
         assert "cfg_scale" not in captured_body
+        settings = captured_body["settings"]
+        assert "cfg_scale" not in settings
+        assert settings["audio"] == "off"
 
 
 # ── vidu.py: generate() 透传 audio / movement_amplitude ─────────────────
