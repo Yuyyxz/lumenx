@@ -40,6 +40,8 @@ from db import Ledger  # noqa: E402
 from schema import PREFIX_TO_TYPE, is_terminal  # noqa: E402
 
 import prices as prices_mod  # noqa: E402
+from pyrate_limiter import Duration, MonotonicClock, Rate, RateItem  # noqa: E402
+from pyrate_limiter import SQLiteBucket  # noqa: E402
 from src.models.kling import KlingError  # noqa: E402,F401  (retryable 语义判定, 重试层用)
 from src.models.mock import MockError, MockImageModel, MockModel  # noqa: E402
 
@@ -66,6 +68,46 @@ class PollResult:
     status: str                     # queued / running / succeeded / failed
     video_url: str = ""
     error: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 限流（PyRateLimiter SQLite 持久桶：额度跨重启/跨实例保留）
+# ---------------------------------------------------------------------------
+_RATE_UNITS = {
+    "s": Duration.SECOND, "sec": Duration.SECOND, "second": Duration.SECOND,
+    "m": Duration.MINUTE, "min": Duration.MINUTE, "minute": Duration.MINUTE,
+    "h": Duration.HOUR, "hr": Duration.HOUR, "hour": Duration.HOUR,
+}
+
+
+def parse_rate(rate: str) -> tuple[int, Any]:
+    """"6/min" / "30/sec" / "100/hour" → (count, Duration)。"""
+    count, _, unit = rate.partition("/")
+    unit_key = unit.strip().lower() or "min"
+    if unit_key not in _RATE_UNITS:
+        raise ValueError(f"--rate 单位不支持: {unit!r}（可用 s/sec/min/hour）")
+    return int(count), _RATE_UNITS[unit_key]
+
+
+class RateGate:
+    """提交限流门。桶状态落 SQLite 文件——脚本崩了重开，"这一窗口已用掉的
+    配额"不归零（内存限流器重启即失忆，会立刻再撞 1302 限频）。
+
+    跨实例共享语义：多个 RateGate 指向同一 db_path 即共享同一份额度；
+    跨多机部署才需要升级 MultiprocessBucket（文件锁版）。
+    """
+
+    def __init__(self, rate: str, db_path: str):
+        count, unit = parse_rate(rate)
+        self.rate_text = rate
+        self.bucket = SQLiteBucket.init_from_file(
+            rates=[Rate(count, unit)], db_path=db_path)
+        self._clock = MonotonicClock()
+
+    def acquire(self) -> None:
+        """阻塞式获取一个提交额度（排队等待而非抛异常，不污染重试计数）。"""
+        while not self.bucket.put(RateItem("kling_submit", self._clock.now())):
+            time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +360,7 @@ class Runner:
         poll_interval: float = 0.05,
         poll_timeout: float = 10.0,
         stale_minutes: float = 30.0,
+        rate_gate: Optional[RateGate] = None,
     ):
         self.ledger = ledger
         self.provider = provider
@@ -327,6 +370,7 @@ class Runner:
         self.poll_interval = poll_interval
         self.poll_timeout = poll_timeout
         self.stale_minutes = stale_minutes
+        self.rate_gate = rate_gate
 
     # ------------------------------------------------------------------
     # 账本读取辅助（只读，不扩 db.py）
@@ -546,6 +590,8 @@ class Runner:
         self.ledger.update(aid, actor=self.actor, status="in_production",
                            source="mock" if model.startswith("mock") else "kling-api")
 
+        if self.rate_gate is not None:
+            self.rate_gate.acquire()
         try:
             task_id = self.provider.submit(prompt, os.path.join(
                 self.output_dir, aid, "video.mp4"),
@@ -606,6 +652,10 @@ def main() -> int:
     ap.add_argument("--retry-failed", action="store_true",
                     help="允许 failed(attempt<3) 资产 retry（attempt+1）重跑")
     ap.add_argument("--limit", type=int, default=None, help="本轮最多处理资产数")
+    ap.add_argument("--rate", default=None,
+                    help="提交限流，如 6/min（PyRateLimiter SQLite 持久桶，额度跨重启保留）")
+    ap.add_argument("--rate-db", default=None,
+                    help="限流桶 SQLite 路径（默认账本同目录 rates.db）")
     ap.add_argument("--poll-interval", type=float, default=0.05)
     ap.add_argument("--poll-timeout", type=float, default=10.0,
                     help="单任务轮询上限秒数；超时留 in_production 待下轮续查")
@@ -636,6 +686,9 @@ def main() -> int:
                     poll_interval=args.poll_interval,
                     poll_timeout=args.poll_timeout,
                     stale_minutes=args.stale_minutes,
+                    rate_gate=RateGate(args.rate, args.rate_db or
+                                       os.path.join(os.path.dirname(args.db), "rates.db"))
+                    if args.rate else None,
                     output_dir=args.output_dir)
     report = runner.run(asset_type=args.asset_type,
                         retry_failed=args.retry_failed,
