@@ -2,9 +2,16 @@
 
 Covers:
 - VideoTask model new fields (models.py)
-- CreateVideoTaskRequest new fields (api.py)
+- CreateVideoTaskRequest new fields (models.py, re-exported by api.py)
 - Pipeline routing of new params to Kling/Vidu adapters
+- Hermeticity: importing/constructing the request model never touches
+  the network or drags in the FastAPI app graph (regression guard for
+  the T-B3b cold-import hang).
 """
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -70,15 +77,16 @@ class TestVideoTaskModel:
         assert task.vidu_audio is None
 
 
-# ── api.py: CreateVideoTaskRequest 新字段 ────────────────────────────────
+# ── models.py: CreateVideoTaskRequest 新字段 ─────────────────────────────
 
 class TestCreateVideoTaskRequest:
     """Verify the API request model accepts new params."""
 
     def _make_request(self, **overrides):
-        import sys, importlib
-        # 需要直接 import api 模块中的 request model
-        from src.apps.comic_gen.api import CreateVideoTaskRequest
+        # Import from the light models module — NOT api.py. Importing the
+        # FastAPI app here was the root cause of the T-B3b cold-import hang
+        # (whole pipeline/tts/oss graph pulled in just to build a DTO).
+        from src.apps.comic_gen.models import CreateVideoTaskRequest
         defaults = dict(
             image_url="https://example.com/img.png",
             prompt="test prompt",
@@ -104,6 +112,79 @@ class TestCreateVideoTaskRequest:
         req = self._make_request(vidu_audio=False, movement_amplitude="medium")
         assert req.vidu_audio is False
         assert req.movement_amplitude == "medium"
+
+
+# ── 防回归：请求模型必须离线可构造、离线可导入（T-B3b 挂死根因守卫）─────
+
+class TestHermeticRequestModel:
+    """The request-model path must never touch the network or the app graph.
+
+    History: test_defaults lazily imported src.apps.comic_gen.api (the full
+    FastAPI app, ~300 modules with import-time side effects). On a cold FS
+    cache / offline box that import stalled for tens of seconds and looked
+    like a hang. Guards below keep the construct path hermetic for good.
+    """
+
+    def test_construct_makes_no_network_calls(self, monkeypatch):
+        """构造 CreateVideoTaskRequest 时禁止任何网络调用（构造层零 IO）。"""
+        import socket
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(
+                f"network attempted during request-model construction: {args} {kwargs}"
+            )
+
+        monkeypatch.setattr(socket, "socket", _boom)
+        monkeypatch.setattr(socket, "create_connection", _boom)
+        monkeypatch.setattr(socket, "getaddrinfo", _boom)
+
+        from src.apps.comic_gen.models import CreateVideoTaskRequest
+        req = CreateVideoTaskRequest(image_url="https://x/img.png", prompt="p")
+        assert req.model == "wan2.6-i2v"
+
+    def test_models_import_is_offline_and_light(self):
+        """子进程先屏蔽 socket 再 import models 并构造请求：
+        1) 全程零网络调用；2) 不拖入 fastapi 应用图。subprocess.run 带
+        timeout——未来若再挂死，这里失败并给出栈，而不是卡死整个套件。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        child_code = (
+            "import socket\n"
+            "class _Blocked(socket.socket):\n"
+            "    def __init__(self, *a, **k):\n"
+            "        raise AssertionError('network attempted during import/construct')\n"
+            "socket.socket = _Blocked\n"
+            "def _boom(*a, **k):\n"
+            "    raise AssertionError('network attempted during import/construct')\n"
+            "socket.create_connection = _boom\n"
+            "socket.getaddrinfo = _boom\n"
+            "from src.apps.comic_gen.models import CreateVideoTaskRequest\n"
+            "req = CreateVideoTaskRequest(image_url='https://x/i.png', prompt='p')\n"
+            "assert req.model == 'wan2.6-i2v'\n"
+            "import sys\n"
+            "heavy = [m for m in ('fastapi', 'aiohttp', 'torch', 'dashscope') if m in sys.modules]\n"
+            "print('HERMETIC_OK heavy=' + ','.join(heavy))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", child_code],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=60,  # a real hang must fail the test, not freeze the suite
+        )
+        assert proc.returncode == 0, f"child failed:\n{proc.stdout}\n{proc.stderr}"
+        marker = next(
+            (ln for ln in proc.stdout.splitlines() if ln.startswith("HERMETIC_OK")),
+            "",
+        )
+        assert marker, f"child did not report HERMETIC_OK:\n{proc.stdout}\n{proc.stderr}"
+        heavy_part = marker.split("heavy=", 1)[1].strip()
+        assert heavy_part == "", f"light import violated, dragged in: {heavy_part}"
+
+    def test_api_reexport_compat(self):
+        """api.py 仍可 `from ...api import CreateVideoTaskRequest`，且与 models 同一对象。"""
+        from src.apps.comic_gen.api import CreateVideoTaskRequest as FromApi
+        from src.apps.comic_gen.models import CreateVideoTaskRequest as FromModels
+        assert FromApi is FromModels
 
 
 # ── kling.py: generate() 接受并传入 sound / cfg_scale ───────────────────

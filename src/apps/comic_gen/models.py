@@ -345,6 +345,46 @@ class VideoTask(BaseModel):
     )
     created_at: float = Field(default_factory=time.time)
 
+class CreateVideoTaskRequest(BaseModel):
+    """Request DTO for POST /projects/{id}/video_tasks.
+
+    Lives here (not api.py) so unit tests can construct it without
+    importing the FastAPI app graph (pipeline/tts/oss side effects).
+    api.py imports and re-exports this class for backward compat.
+    """
+    image_url: str
+    prompt: str
+    frame_id: Optional[str] = None
+    duration: int = 5
+    seed: Optional[int] = None
+    resolution: str = "720p"
+    generate_audio: bool = False
+    audio_url: Optional[str] = None
+    prompt_extend: bool = True
+    negative_prompt: Optional[str] = None
+    batch_size: int = 1
+    model: str = "wan2.6-i2v"
+    shot_type: str = "single"  # 'single' or 'multi' (only for wan2.6-i2v)
+    generation_mode: str = "i2v"  # 'i2v' (image-to-video) or 'r2v' (reference-to-video)
+    reference_video_urls: List[str] = []  # Reference video URLs for R2V (max 3)
+    # Kling params
+    mode: Optional[str] = None
+    sound: Optional[str] = None
+    cfg_scale: Optional[float] = None
+    # Vidu params
+    vidu_audio: Optional[bool] = None
+    movement_amplitude: Optional[str] = None
+    # HappyHorse params
+    reference_image_urls: List[str] = []  # Reference image URLs for HH R2V (max 9)
+    ratio: Optional[str] = None  # Aspect ratio for HH T2V/R2V
+    # Watermark toggle (wan / kling / vidu / pixverse / happyhorse video).
+    # None = leave to provider default; True/False = explicit user choice.
+    watermark: Optional[bool] = None
+    # Source tab in the Storyboard R2V workbench. Distinct from
+    # generation_mode (backend dispatcher hint) — used by the candidates
+    # panel to group takes per UI tab on refresh.
+    workbench_tab: Optional[str] = None  # 't2i_i2v' | 'direct_r2v'
+
 class Character(BaseModel):
     id: str = Field(..., description="Unique identifier for the character")
     name: str = Field(..., description="Name of the character")
