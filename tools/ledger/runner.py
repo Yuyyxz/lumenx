@@ -368,6 +368,10 @@ class RunReport:
     guard_inflight: list[str] = field(default_factory=list)      # 防双写拒跑（未超时）
     orphan_reset: list[str] = field(default_factory=list)        # 超时孤儿回收 failed
     still_running: list[str] = field(default_factory=list)       # 轮询超时/查单仍在跑
+    cost_spent: float = 0.0               # 本次 run 新增成本（CNY，终态实入账）
+    cost_total: float = 0.0               # 账本累计成本（含历史，run 结束时快照）
+    unpriced: list[str] = field(default_factory=list)            # 价格表未覆盖
+    budget_stop: bool = False             # 预算触顶：完成在途后停止接新提交
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -382,6 +386,7 @@ class Runner:
         ledger: Ledger,
         provider: Any,
         *,
+        price_table: Optional[dict] = None,
         image_model: str = "mock-image",
         actor: str = "runner",
         output_dir: str = "",
@@ -393,6 +398,7 @@ class Runner:
     ):
         self.ledger = ledger
         self.provider = provider
+        self.prices = price_table if price_table is not None else prices_mod.load_prices()
         self.image_model = image_model
         self.actor = actor
         self.output_dir = output_dir
@@ -431,6 +437,19 @@ class Runner:
     @staticmethod
     def _task_id_of(row: dict) -> str:
         return str(Runner._data_of(row).get("provider_task_id") or "")
+
+    def _spent_total(self) -> float:
+        """账本累计成本（cost 列可解析为数字的求和；文本/脏值按 0）。"""
+        return sum(_parse_cost(r.get("cost")) for r in self._all_assets())
+
+    def _cost_text(self, model: str, duration: Optional[int], asset_id: str,
+                   report: RunReport) -> str:
+        """查价 → 成本文本；unpriced 记 "0" 并留痕（宁缺勿错，不阻塞生成）。"""
+        cost = prices_mod.cost_for(self.prices, model, duration)
+        if cost is None:
+            report.unpriced.append(asset_id)
+            return "0"
+        return str(cost)
 
     def _updated_age(self, row: dict) -> float:
         """updated_at 距今的分钟数；解析失败返回 +inf（按超时处理）。"""
@@ -508,11 +527,18 @@ class Runner:
         self.provider.download(video_url, output_path)
         with open(output_path, "rb") as f:
             content_hash = _sha16(f.read())
+        model = str(data.get("model") or "")
+        duration = data.get("duration")
+        cost_text = self._cost_text(model, int(duration) if duration else None,
+                                    asset_id, report)
+        # 权责发生制：任务成功即入账（钱还没扣，预算先记账）；events 记流水
         self.ledger.update(
             asset_id, actor=self.actor, status="done",
-            content_hash=content_hash, output_path=output_path,
-            detail=f"downloaded from task {self._task_id_of(row)}",
+            content_hash=content_hash, output_path=output_path, cost=cost_text,
+            detail=f"downloaded from task {self._task_id_of(row)};"
+                   f" cost={cost_text} CNY model={model} duration={duration}",
         )
+        report.cost_spent += _parse_cost(cost_text)
         report.completed.append(asset_id)
 
     # ------------------------------------------------------------------
@@ -575,10 +601,12 @@ class Runner:
             return None
         with open(image_path, "rb") as f:
             content_hash = _sha16(f.read())
+        cost_text = self._cost_text(self.image_model, None, kf_id, report)
         self.ledger.update(
             kf_id, actor=self.actor, status="done",
-            content_hash=content_hash, output_path=image_path,
-            detail=f"image done model={self.image_model}")
+            content_hash=content_hash, output_path=image_path, cost=cost_text,
+            detail=f"image done model={self.image_model}; cost={cost_text} CNY")
+        report.cost_spent += _parse_cost(cost_text)
         report.completed.append(kf_id)
         return image_path
 
@@ -596,7 +624,8 @@ class Runner:
                                         duration=duration, image_url=image_url)
         return with_transient_retry(_once, attempts=self.submit_attempts)
 
-    def _process_video(self, row: dict, report: RunReport) -> None:
+    def _process_video(self, row: dict, report: RunReport,
+                       max_budget: Optional[float] = None) -> None:
         aid = row["asset_id"]
         data = self._data_of(row)
         prompt = data.get("video_prompt") or row.get("description") or aid
@@ -607,6 +636,14 @@ class Runner:
         if is_terminal(row["status"], row["attempt_count"]):
             report.skipped_terminal.append(aid)
             return
+
+        # 预算粗检：KF+VD 全价预估（unpriced 模型无法预估按 0 放行，终态实入账留痕）
+        if max_budget is not None:
+            vd_unit = prices_mod.lookup_price(self.prices, model, duration) or 0.0
+            kf_unit = prices_mod.lookup_price(self.prices, self.image_model) or 0.0
+            if vd_unit + kf_unit > max_budget - self._spent_total():
+                report.budget_stop = True
+                return
 
         kf_path = self._ensure_keyframe(row, report)
         if kf_path is None:
@@ -623,6 +660,13 @@ class Runner:
                                note=f"skip: 同指纹 {dup} 已 done（幂等）")
             report.skipped_duplicate.append(f"{aid}=={dup}")
             return
+
+        # 预算细检：提交前按账本现值复核（KF 已入账，余额不够本单就不提交）
+        if max_budget is not None:
+            vd_unit = prices_mod.lookup_price(self.prices, model, duration)
+            if vd_unit is not None and vd_unit > max_budget - self._spent_total():
+                report.budget_stop = True
+                return
 
         # 认领流转：draft→approved→in_production（retry 可直接 in_production）
         if row["status"] == "draft":
@@ -655,6 +699,7 @@ class Runner:
     # 主入口
     # ------------------------------------------------------------------
     def run(self, *, asset_type: str = "VD", retry_failed: bool = False,
+            max_budget: Optional[float] = None,
             limit: Optional[int] = None) -> RunReport:
         asset_type = _normalize_type(asset_type)
         report = RunReport(asset_type=asset_type)
@@ -675,8 +720,11 @@ class Runner:
                 candidates.append(row)
 
         for row in candidates[:limit if limit is not None else len(candidates)]:
-            self._process_video(row, report)
+            self._process_video(row, report, max_budget)
+            if report.budget_stop:
+                break  # 预算触顶：本资产未动，已提交在途的均已轮询完毕（串行模型）
 
+        report.cost_total = self._spent_total()
         return report
 
 
@@ -691,6 +739,8 @@ def main() -> int:
                     help="处理的资产类型（默认 VD）")
     ap.add_argument("--retry-failed", action="store_true",
                     help="允许 failed(attempt<3) 资产 retry（attempt+1）重跑")
+    ap.add_argument("--max-budget", type=float, default=None,
+                    help="预算护栏（CNY）：超限完成在途任务后停止接新提交")
     ap.add_argument("--limit", type=int, default=None, help="本轮最多处理资产数")
     ap.add_argument("--rate", default=None,
                     help="提交限流，如 6/min（PyRateLimiter SQLite 持久桶，额度跨重启保留）")
@@ -722,6 +772,7 @@ def main() -> int:
         provider = KlingBatchProvider(api_key)
 
     runner = Runner(ledger, provider,
+                    price_table=prices_mod.load_prices(),
                     image_model=args.image_model,
                     poll_interval=args.poll_interval,
                     poll_timeout=args.poll_timeout,
@@ -732,6 +783,7 @@ def main() -> int:
                     output_dir=args.output_dir)
     report = runner.run(asset_type=args.asset_type,
                         retry_failed=args.retry_failed,
+                        max_budget=args.max_budget,
                         limit=args.limit)
     print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     ledger.close()
