@@ -105,6 +105,7 @@ class RateGate:
     def __init__(self, rate: str, db_path: str):
         count, unit = parse_rate(rate)
         self.rate_text = rate
+        self.db_path = db_path
         self.bucket = SQLiteBucket.init_from_file(
             rates=[Rate(count, unit)], db_path=db_path)
         self._clock = MonotonicClock()
@@ -624,6 +625,34 @@ class Runner:
                                         duration=duration, image_url=image_url)
         return with_transient_retry(_once, attempts=self.submit_attempts)
 
+    def _recheck_failed_task(self, row: dict, report: RunReport) -> Optional[str]:
+        """failed 资产带 task_id 时先查单（--retry-failed 重跑路径）。
+
+        返回:
+        - "done"    → 查单发现任务实际成功（误报/上次下载中断），已下载落账；
+        - "skip"    → 任务仍在跑（queued/running），保持 failed 留下轮再查，不重提交；
+        - None      → 确认任务已失败终态（或无 task_id），调用方走 retry 重提交。
+        """
+        task_id = self._task_id_of(row)
+        if not task_id:
+            return None
+        try:
+            result = self.provider.poll(task_id)
+        except ProviderError as e:
+            if e.retryable:
+                report.still_running.append(row["asset_id"])
+                return "skip"
+            return None  # 查单本身失败且不可重试 → 按确认失败处理
+        if result.status == POLL_SUCCEEDED:
+            self._finish_done(row["asset_id"], row, result.video_url, report)
+            return "done"
+        if result.status in (POLL_QUEUED, POLL_RUNNING):
+            report.still_running.append(row["asset_id"])
+            self.ledger.update(row["asset_id"], actor=self.actor,
+                               note="recheck: provider 任务仍在跑，保持 failed 待下轮查单")
+            return "skip"
+        return None  # failed/cancelled/expired 确认终态
+
     def _process_video(self, row: dict, report: RunReport,
                        max_budget: Optional[float] = None) -> None:
         aid = row["asset_id"]
@@ -636,6 +665,13 @@ class Runner:
         if is_terminal(row["status"], row["attempt_count"]):
             report.skipped_terminal.append(aid)
             return
+
+        # failed 重跑（--retry-failed）：先查单确认，不盲目重提交烧钱
+        if row["status"] == "failed":
+            verdict = self._recheck_failed_task(row, report)
+            if verdict is not None:
+                return
+            self.ledger.update(aid, actor=self.actor, status="retry")  # attempt+1
 
         # 预算粗检：KF+VD 全价预估（unpriced 模型无法预估按 0 放行，终态实入账留痕）
         if max_budget is not None:
@@ -668,7 +704,7 @@ class Runner:
                 report.budget_stop = True
                 return
 
-        # 认领流转：draft→approved→in_production（retry 可直接 in_production）
+        # 认领流转：draft→approved→in_production（retry/failed→retry 可直接 in_production）
         if row["status"] == "draft":
             self.ledger.update(aid, actor=self.actor, status="approved",
                                fingerprint=fingerprint)
