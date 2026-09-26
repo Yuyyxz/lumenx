@@ -23,13 +23,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+import tenacity
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +41,8 @@ if _REPO_ROOT not in sys.path:
 
 from db import Ledger  # noqa: E402
 from schema import PREFIX_TO_TYPE, is_terminal  # noqa: E402
+
+logger = logging.getLogger("ledger.runner")
 
 import prices as prices_mod  # noqa: E402
 from pyrate_limiter import Duration, MonotonicClock, Rate, RateItem  # noqa: E402
@@ -108,6 +113,29 @@ class RateGate:
         """阻塞式获取一个提交额度（排队等待而非抛异常，不污染重试计数）。"""
         while not self.bucket.put(RateItem("kling_submit", self._clock.now())):
             time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# 重试（tenacity，仅瞬态错误：wait_random_exponential 防惊群）
+# ---------------------------------------------------------------------------
+def _is_retryable_error(e: BaseException) -> bool:
+    """只有 provider 判定为瞬态的错误可重试（KlingError.retryable /
+    ProviderError.retryable：限频 1302 / 超并发 1303 / 服务端 5xxx / 网络）。
+    参数 / 账户（欠费）/ 政策类与任务级失败重试纯烧时间，原样穿透。"""
+    return isinstance(e, (KlingError, ProviderError)) and bool(e.retryable)
+
+
+def with_transient_retry(fn: Callable[[], Any], *, attempts: int = 3,
+                         multiplier: float = 0.05, max_wait: float = 1.0) -> Any:
+    """对 fn() 做随机指数退避重试。纪律（survey §3.1）：4xx 永不重试；
+    retryable 与否由 provider 异步错误分类决定，这里不做第二套判定。"""
+    return tenacity.retry(
+        retry=tenacity.retry_if_exception(_is_retryable_error),
+        wait=tenacity.wait_random_exponential(multiplier=multiplier, max=max_wait),
+        stop=tenacity.stop_after_attempt(attempts),
+        before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )(fn)()
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +389,7 @@ class Runner:
         poll_timeout: float = 10.0,
         stale_minutes: float = 30.0,
         rate_gate: Optional[RateGate] = None,
+        submit_attempts: int = 3,
     ):
         self.ledger = ledger
         self.provider = provider
@@ -371,6 +400,7 @@ class Runner:
         self.poll_timeout = poll_timeout
         self.stale_minutes = stale_minutes
         self.rate_gate = rate_gate
+        self.submit_attempts = submit_attempts
 
     # ------------------------------------------------------------------
     # 账本读取辅助（只读，不扩 db.py）
@@ -555,6 +585,17 @@ class Runner:
     # ------------------------------------------------------------------
     # 单个 VD 资产处理
     # ------------------------------------------------------------------
+    def _submit(self, prompt: str, output_path: str, *, model: str,
+                duration: int, image_url: str) -> str:
+        """提交单任务。分层纪律（survey §3.2）：限流门在重试体内层管频率
+        （每次真实提交都受限流约束），tenacity 在外层管失败重放。"""
+        def _once() -> str:
+            if self.rate_gate is not None:
+                self.rate_gate.acquire()
+            return self.provider.submit(prompt, output_path, model=model,
+                                        duration=duration, image_url=image_url)
+        return with_transient_retry(_once, attempts=self.submit_attempts)
+
     def _process_video(self, row: dict, report: RunReport) -> None:
         aid = row["asset_id"]
         data = self._data_of(row)
@@ -590,15 +631,14 @@ class Runner:
         self.ledger.update(aid, actor=self.actor, status="in_production",
                            source="mock" if model.startswith("mock") else "kling-api")
 
-        if self.rate_gate is not None:
-            self.rate_gate.acquire()
         try:
-            task_id = self.provider.submit(prompt, os.path.join(
+            task_id = self._submit(prompt, os.path.join(
                 self.output_dir, aid, "video.mp4"),
                 model=model, duration=duration, image_url=kf_path)
-        except ProviderError as e:
+        except (ProviderError, KlingError) as e:
+            # 不可重试（或重试耗尽）→ failed 终态 + events 留痕（Ledger.update 记流水）
             self.ledger.update(aid, actor=self.actor, status="failed",
-                               detail=f"submit: {e}")
+                               detail=f"submit failed: {e}")
             report.failed.append(aid)
             report.errors.append(f"{aid}: submit {e}")
             return
