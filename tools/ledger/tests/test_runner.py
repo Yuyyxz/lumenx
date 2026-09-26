@@ -227,10 +227,12 @@ def test_e_rate_bucket_shared_across_instances(tmp_path):
     # 若额度翻倍（不共享），4 连发会在 ~0s 内完成；共享 3/s 则必然 ≥1s
     assert total - mid >= 0.5 and total >= 1.0, (
         f"两实例提交总耗时 {total:.2f}s，限流桶未共享（额度被翻倍）")
-    # 直接桶层断言：第 5 次 acquire 在 1s 窗口内必被拒
-    gate5 = RateGate("3/sec", runner1.rate_gate.db_path)
-    assert gate5.bucket.put(RateItem("kling_submit",
-                                     MonotonicClock().now())) is False
+    # 桶层确定性断言（独立桶，无跨窗口时序干扰）：3/sec 连发 3 次后第 4 次必拒
+    pure = RateGate("3/sec", str(tmp_path / "pure_rates.db"))
+    for _ in range(3):
+        pure.acquire()
+    assert pure.bucket.put(RateItem("kling_submit",
+                                    MonotonicClock().now())) is False
     led.close()
 
 
