@@ -2,7 +2,10 @@
 
 解析对象：C:\\Users\\YY\\剧本项目\\剧本\\第N集-*-分镜剧本.md 的 DSL：
 - 文件头元信息：> **画幅**: ... | **时长**: 约 75 秒 | **场景数**: N
-- 场景头：### 【Scene n】名称（对应场景卡 SC-xx）
+- 场景头：### 【Scene n】名称（对应场景卡 SC-xx）；括注内可带限定词后缀
+  （如「SC-02 外」「SC-02 · 打烊后」）——SC 引用照常提取，剩余文字作为
+  scene_qualifier 保留进 SB 行 data（T-B6 修复：旧正则要求括注严格只有
+  引用，带限定词的整头解析失败，E07/E10/E12 共 25 镜因此丢失场景归属）
 - 镜头块头：**[mm:ss.d – mm:ss.d] 标题**
 - 镜头行：`[景别|运镜|简述]`（反引号包裹）
 - 标注行：`[Emotion: ... | Hook: ... | Connection: ... | Sound: ...]`
@@ -47,7 +50,7 @@ RE_META_VALUE = re.compile(r"\*\*(.+?)\*\*[：:]\s*([^|]+)")
 RE_DURATION_DECL = re.compile(r"约\s*(\d+)\s*秒")
 RE_SCENE_COUNT_DECL = re.compile(r"场景数\*\*[：:]\s*(\d+)")
 RE_SCENE_HEADER = re.compile(
-    r"^###\s*【Scene\s*(\d+)】\s*(.+?)\s*[（(](?:对应)?\s*(?:场景卡)?\s*(SC-\d+[a-z]?)\s*[)）]"
+    r"^###\s*【Scene\s*(\d+)】\s*(.+?)\s*[（(]([^）)]*)[）)]"
 )
 RE_SHOT_HEADER = re.compile(
     r"^\*\*\[(\d{1,2}):(\d{2})(?:\.(\d+))?\s*[–—-]\s*(\d{1,2}):(\d{2})(?:\.(\d+))?\]\s*(.*?)\*\*\s*$"
@@ -66,6 +69,27 @@ RE_PR_REF = re.compile(r"PR-\d+[a-z]?")
 RE_SHOT_FILENAME = re.compile(r"^第(\d+)集-(.+?)-分镜剧本\.md$")
 
 ANNOTATION_KEYS = ("Emotion", "Hook", "Connection", "Sound")
+
+# 场景头括注里的"对应场景卡"前缀（标准形态），提取引用后从限定词中剥掉
+_SCENE_ANNO_PREFIX = re.compile(r"^(?:对应)?\s*(?:场景卡)?\s*")
+
+
+def _split_scene_annotation(anno: str) -> tuple[str, str]:
+    """场景头括注 → (SC 引用, 限定词)。
+
+    括注 = 「对应场景卡 SC-01」标准形态，或带限定词的变体（真实样本：
+    「对应场景卡 SC-02 外」「SC-02 · 打烊后」「SC-02 外」）。限定词是
+    有效信息（机位在场景外/时间状态），照常提取引用后原样保留。
+    括注里没有 SC 引用时返回 ("", 清洗后原文)，场景块仍计数、镜头照常
+    入账（scene 为空 → parent_ids 无 SC，与旧行为一致但不再整头丢失）。
+    """
+    anno = anno.strip()
+    m = RE_SC_REF.search(anno)
+    if not m:
+        return "", anno
+    qualifier = anno[: m.start()] + anno[m.end():]
+    qualifier = _SCENE_ANNO_PREFIX.sub("", qualifier).strip(" ·・-—_")
+    return m.group(0), qualifier
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +191,14 @@ def parse_episode(path: str) -> dict:
 
             scene_m = RE_SCENE_HEADER.match(stripped)
             if scene_m:
-                idx, name, sc_ref = scene_m.groups()
-                current_scene = {"index": int(idx), "name": name.strip(), "sc_ref": sc_ref}
+                idx, name, anno = scene_m.groups()
+                sc_ref, qualifier = _split_scene_annotation(anno)
+                current_scene = {
+                    "index": int(idx),
+                    "name": name.strip(),
+                    "sc_ref": sc_ref,
+                    "qualifier": qualifier,
+                }
                 ep["scenes"].append(current_scene)
                 current_shot = None
                 continue
@@ -191,6 +221,7 @@ def parse_episode(path: str) -> dict:
                     "annotation": {},
                     "keyframe_inserts": [],
                     "scene": current_scene["sc_ref"] if current_scene else "",
+                    "scene_qualifier": current_scene.get("qualifier", "") if current_scene else "",
                     "text_parts": [],
                 }
                 ep["shots"].append(current_shot)
@@ -386,6 +417,7 @@ def build_asset_rows(episodes: list[dict], cards: dict) -> tuple[list[dict], dic
                     "episode": ep["episode"],
                     "ep_title": ep["title"],
                     "s_no": sh["s_no"],
+                    "scene_qualifier": sh.get("scene_qualifier", ""),
                     "tc_start": sh["start"],
                     "tc_end": sh["end"],
                     "duration_s": duration,

@@ -224,3 +224,47 @@ def test_real_corpu_expected_totals_guard(script_dir):
     """EXPECTED 常量与调研口径一致（15 集 / 179 镜），防止有人悄悄改预期硬凑。"""
     assert imp.EXPECTED_EPISODES == 15
     assert imp.EXPECTED_SHOTS == 179
+
+
+# ---------------------------------------------------------------------------
+# T-B6 修复回归：场景头括注带限定词（外/打烊后）不再整头解析失败
+# （真实样本：E07「对应场景卡 SC-02 外」/ E10「SC-02 · 打烊后」/ E12「SC-02 外」）
+# ---------------------------------------------------------------------------
+def test_split_scene_annotation_qualifier_forms():
+    assert imp._split_scene_annotation("对应场景卡 SC-01") == ("SC-01", "")
+    assert imp._split_scene_annotation("对应场景卡 SC-02 外") == ("SC-02", "外")
+    assert imp._split_scene_annotation("SC-02 · 打烊后") == ("SC-02", "打烊后")
+    assert imp._split_scene_annotation("SC-02 外") == ("SC-02", "外")
+    assert imp._split_scene_annotation("SC-01b") == ("SC-01b", "")
+    assert imp._split_scene_annotation("暂无对应卡") == ("", "暂无对应卡")
+
+
+def test_scene_header_with_qualifier_parses(tmp_path):
+    """带限定词的场景头：镜头归属 SC-02，qualifier 透传到 shot。"""
+    ep_md = EP1.replace(
+        "### 【Scene 1】夜桥（对应场景卡 SC-01）",
+        "### 【Scene 1】店门口（对应场景卡 SC-02 外）",
+    )
+    path = tmp_path / "第3集-限定词-分镜剧本.md"
+    path.write_text(ep_md, encoding="utf-8")
+    ep = imp.parse_episode(str(path))
+    assert ep["scenes"][0]["sc_ref"] == "SC-02"
+    assert ep["scenes"][0]["qualifier"] == "外"
+    assert len(ep["shots"]) == 2
+    assert all(sh["scene"] == "SC-02" for sh in ep["shots"])
+    assert {sh["scene_qualifier"] for sh in ep["shots"]} == {"外"}
+
+
+def test_scene_header_without_reference_still_counts(tmp_path):
+    """括注里没有 SC 引用：场景块仍计数、镜头照常入账（scene 为空）。"""
+    ep_md = EP1.replace(
+        "### 【Scene 1】夜桥（对应场景卡 SC-01）",
+        "### 【Scene 1】无名地点（临时场景）",
+    )
+    path = tmp_path / "第4集-无引用-分镜剧本.md"
+    path.write_text(ep_md, encoding="utf-8")
+    ep = imp.parse_episode(str(path))
+    assert ep["scenes"][0]["sc_ref"] == ""
+    assert ep["scenes"][0]["qualifier"] == "临时场景"
+    assert len(ep["shots"]) == 2
+    assert all(sh["scene"] == "" for sh in ep["shots"])
