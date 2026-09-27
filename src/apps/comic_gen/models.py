@@ -1,7 +1,8 @@
 from typing import List, Optional, Dict, Any, Literal
 from enum import Enum
+import re
 import time
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ...utils import get_logger
 from ...utils.model_catalog import get_default_model_settings
@@ -385,6 +386,99 @@ class CreateVideoTaskRequest(BaseModel):
     # panel to group takes per UI tab on refresh.
     workbench_tab: Optional[str] = None  # 't2i_i2v' | 'direct_r2v'
 
+# === T-B6 方法论三分离角色卡（persona / image / voice + 三锚点） ===
+# 方法论来源（只抄规范、不 vendor 原文）：
+# - eternityspring/shuohao-skills（Apache-2.0）cast.json schema：persona/image/voice
+#   三分离；image.prompt 禁止出现人名、必写族裔/年代/地域、negativePrompt 独立维护。
+# - Hao0321/ai-short-drama（MIT）production_pack.schema.json：visual_anchor /
+#   performance_anchor / voice_anchor 三锚点字段语义。
+# 持久化边界 tolerant：全部字段 Optional，老项目数据没有新字段时解析为 None，绝不炸。
+
+class PersonaProfile(BaseModel):
+    """人物设定卡（是谁）：与出图提示词、音色解耦的纯设定层。"""
+    gender: Optional[str] = Field(None, description="性别")
+    age_range: Optional[str] = Field(None, description="年龄段（如\"约七十岁\"）")
+    identity: Optional[str] = Field(None, description="身份/职业")
+    personality: Optional[str] = Field(None, description="性格关键词（3-5 个）")
+    motivation: Optional[str] = Field(None, description="核心动机")
+    arc: Optional[str] = Field(None, description="人物弧线")
+
+
+class ImageCard(BaseModel):
+    """出图卡（怎么画）：提示词层。prompt 规范：禁人名、必写族裔/年代/地域。"""
+    prompt: Optional[str] = Field(None, description="出图提示词（英文；禁人名；必写族裔/年代/地域）")
+    prompt_local: Optional[str] = Field(None, description="出图提示词本地语言版（同样禁人名）")
+    negative_prompt: Optional[str] = Field(None, description="负面提示词（独立维护，不与正向混写）")
+    tags: List[str] = Field(default_factory=list, description="检索标签（题材/年代/色板/材质/光照）")
+
+
+class VoiceCard(BaseModel):
+    """声音卡（怎么说话）：TTS 音色语义层，与 voice_id 解耦的描述层。"""
+    timbre: Optional[str] = Field(None, description="音色")
+    pitch: Optional[str] = Field(None, description="音高")
+    pace: Optional[str] = Field(None, description="语速/气口")
+    accent: Optional[str] = Field(None, description="口音/地域腔调")
+    emotion: Optional[str] = Field(None, description="基底情绪")
+    prompt: Optional[str] = Field(None, description="给 TTS 音色引擎的英文描述")
+
+
+# 出图提示词规范关键词（warning 级启发式，宁滥勿缺——只是提醒，不拦截）。
+# 族裔：中文靠"族/裔/混血"等构词 + 常见人群词；英文走小写包含匹配。
+_IMAGE_PROMPT_ETHNICITY_KEYWORDS = (
+    "族", "裔", "混血", "亚洲人", "东亚", "东南亚", "西方人", "白人", "黑人",
+    "asian", "european", "african", "caucasian", "hispanic", "latino",
+    "chinese", "japanese", "korean", "vietnamese", "thai", "indian",
+    "middle eastern", "polynesian", "indigenous",
+)
+_IMAGE_PROMPT_ERA_KEYWORDS = (
+    "年代", "世纪", "民国", "古代", "近代", "现代", "当代", "上古", "未来", "末世",
+    "唐朝", "唐代", "宋朝", "宋代", "明朝", "明代", "清朝", "清代", "汉朝",
+    "秦朝", "战国", "三国", "魏晋", "90年代", "80年代",
+    "dynasty", "era", "period", "century", "victorian", "medieval",
+    "ancient", "modern", "contemporary", "futuristic", "post-apocalyptic", "wartime",
+)
+_IMAGE_PROMPT_REGION_KEYWORDS = (
+    "城市", "乡村", "小镇", "农村", "都市", "北方", "南方", "江南", "塞北",
+    "中原", "岭南", "京城", "北京", "上海", "香港", "东京", "京都", "巴黎",
+    "伦敦", "纽约", "海滨", "山区", "沙漠", "草原",
+    "city", "town", "village", "rural", "urban", "countryside", "metropolis",
+    "region", "province", "northern", "southern", "coastal", "mountain",
+    "desert", "china", "japan", "korea", "europe", "america", "paris", "london",
+)
+
+
+def check_image_prompt_rules(prompt: Optional[str], character_name: Optional[str]) -> List[str]:
+    """出图提示词规范检查（纯函数，warning 级，不抛异常不硬 fail）。
+
+    规则（shuohao cast.json 语义）：
+    - prompt 出现角色名 → warning（应用外观描述替代人名，防文字被渲染进画面）；
+    - 缺族裔/年代/地域任一类定位词 → warning（缺失会导致跨镜人种/时代/地域漂移）。
+    prompt 为空时返回空列表——未填写不等于违规（tolerant）。
+    """
+    text = (prompt or "").strip()
+    if not text:
+        return []
+    lowered = text.lower()
+    warnings: List[str] = []
+    name = (character_name or "").strip()
+    if name and name in text:
+        warnings.append(
+            f"image.prompt 出现角色名「{name}」——规范要求用外观描述替代人名"
+        )
+    missing = []
+    if not any(k in lowered for k in _IMAGE_PROMPT_ETHNICITY_KEYWORDS):
+        missing.append("族裔")
+    if not any(k in lowered for k in _IMAGE_PROMPT_ERA_KEYWORDS) and not re.search(r"\d{2,4}s", lowered):
+        missing.append("年代")
+    if not any(k in lowered for k in _IMAGE_PROMPT_REGION_KEYWORDS):
+        missing.append("地域")
+    if missing:
+        warnings.append(
+            f"image.prompt 缺少定位词：{'、'.join(missing)}——必写族裔/年代/地域，防止跨镜形象漂移"
+        )
+    return warnings
+
+
 class Character(BaseModel):
     id: str = Field(..., description="Unique identifier for the character")
     name: str = Field(..., description="Name of the character")
@@ -395,6 +489,14 @@ class Character(BaseModel):
     # persona is a free-text label grouping multiple visual variants of
     # the same "person". v1 schema only; v2 surfaces grouping in UI.
     persona: str = Field("", description="Persona group label (multiple visual variants of the same person share a persona)")
+
+    # === T-B6 方法论三分离角色卡（shuohao cast.json + Hao0321 三锚点，全 Optional） ===
+    persona_profile: Optional[PersonaProfile] = Field(None, description="人物设定卡：性别/年龄段/身份/性格/动机/弧线")
+    image_card: Optional[ImageCard] = Field(None, description="出图卡：prompt 禁人名、必写族裔/年代/地域，negative_prompt 独立")
+    voice_card: Optional[VoiceCard] = Field(None, description="声音卡：音色/音高/语速/口音/情绪/引擎描述")
+    visual_anchor: Optional[str] = Field(None, description="视觉锚点：跨镜必须逐字复述的外观锚点句")
+    performance_anchor: Optional[str] = Field(None, description="表演锚点：标志性表演特征（姿态/习惯动作）")
+    voice_anchor: Optional[str] = Field(None, description="声音锚点：一句话锁定音色气质")
 
     # New Attributes
     age: Optional[str] = Field(None, description="Age of the character")
@@ -464,6 +566,15 @@ class Character(BaseModel):
     starred: bool = Field(False, description="User-starred flag for the asset library shortlist")
     status: GenerationStatus = GenerationStatus.PENDING
 
+    @model_validator(mode="after")
+    def _warn_image_prompt_rules(self) -> "Character":
+        """出图提示词规范检查（warning 级，不硬 fail——LLM/校验边界 strict 指
+        schema 结构；这里的内容规范只记 warning，老数据/半成品数据照常加载）。"""
+        if self.image_card and self.image_card.prompt:
+            for w in check_image_prompt_rules(self.image_card.prompt, self.name):
+                logger.warning("[image_prompt_rules] %s: %s", self.name, w)
+        return self
+
 class Scene(BaseModel):
     id: str = Field(..., description="Unique identifier for the scene")
     name: str = Field(..., description="Name of the location/scene")
@@ -471,6 +582,10 @@ class Scene(BaseModel):
     visual_weight: int = Field(3, description="Visual importance weight (1-5)")
     time_of_day: Optional[str] = Field(None, description="Time of day (e.g. Night, Day)")
     lighting_mood: Optional[str] = Field(None, description="Lighting atmosphere")
+
+    # === T-B6 方法论卡（场景只取出图卡 + 视觉锚点；无人设/语音层） ===
+    image_card: Optional[ImageCard] = Field(None, description="场景出图卡：prompt/negative_prompt 分离维护")
+    visual_anchor: Optional[str] = Field(None, description="视觉锚点：跨镜锁定的空间/光照/色彩锚点句")
     image_url: Optional[str] = Field(None, description="URL of the generated scene reference image (Legacy)")
     image_asset: Optional[ImageAsset] = Field(default_factory=ImageAsset, description="Scene image asset container")
     
