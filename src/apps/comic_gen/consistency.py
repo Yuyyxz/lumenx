@@ -120,9 +120,6 @@ def assemble_r2v_prompt(
 # 的子集（在场声明核对 + 出现→消失→又出现）落成纯函数；站位/视线/持物
 # 的语义连续性仍留给 LLM 注入清单（llm.CONTINUITY_CHECKLIST）与人工审查。
 
-# 时间码齐备时, 两镜窗口间隔 ≤ 0.5s 视为时间相邻（分镜 DSL 常见 0.1s 精度）
-_ADJACENT_EPSILON_S = 0.5
-
 
 @dataclass(frozen=True)
 class ShotRef:
