@@ -16,10 +16,13 @@ license=Other —— 只重写实现, 不 vendor 代码）。纯函数, 无 I/O�
 
 接入点: prompt_assembly.assemble_r2v_prompt_with_locks（r2v 提交前把锁定行
 拼进 prompt）。reference 分型元数据到齐后, pipeline 只需一行调用。
+
+T-B6 新增: check_presence_and_continuity —— 在场性/跨镜连续性机器 lint
+（纯数据进出, 无 I/O, 方便单测与后续接 runner / 账本数据）。
 """
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 class ReferenceLockKind(str, Enum):
@@ -106,3 +109,146 @@ def assemble_r2v_prompt(
     clean = (base_prompt or "").rstrip()
     prompt = f"{clean}\n\n{lock_block}" if clean else lock_block
     return prompt, alias_map
+
+
+# ── T-B6 在场性 / 跨镜连续性 lint（纯数据进出, 无 I/O） ─────────────────────
+# 方法论来源: zenstory-ai/drama-skills（MIT License,
+# skills/short-drama-storyboard/references/review-and-fixtures.md）——
+# "相邻镜头的站位、朝向、视线、持物、伤势、光态与可读文字连续"；
+# "关键帧正文点名的人物、地点或道具必须出现在本镜视觉依据里"；
+# 跨镜物件"不能让合法终点之间靠镜外瞬移衔接"。这里只把其中**机器可查**
+# 的子集（在场声明核对 + 出现→消失→又出现）落成纯函数；站位/视线/持物
+# 的语义连续性仍留给 LLM 注入清单（llm.CONTINUITY_CHECKLIST）与人工审查。
+
+# 时间码齐备时, 两镜窗口间隔 ≤ 0.5s 视为时间相邻（分镜 DSL 常见 0.1s 精度）
+_ADJACENT_EPSILON_S = 0.5
+
+
+@dataclass(frozen=True)
+class ShotRef:
+    """一镜的引用图切片: 所属场景 + 在场实体引用 + 可选时间码窗口（秒）。
+
+    时间码缺失（None）时退化为场内输入顺序相邻——账本 SB 行（data.tc_start/
+    tc_end）与分镜 DSL（[mm:ss.d – mm:ss.d]）均可直连, 无时间码也能跑。
+    """
+    shot_id: str
+    scene_id: str
+    character_ids: Tuple[str, ...] = ()
+    prop_ids: Tuple[str, ...] = ()
+    start_s: Optional[float] = None
+    end_s: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class SceneCast:
+    """场景声明的角色表（分镜之外的在场基准; 缺失则跳过声明类检查）。"""
+    scene_id: str
+    character_ids: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContinuityWarning:
+    """一条 lint warning（warning 级, 永不拦截流程）。"""
+    kind: str          # cast_member_never_on_screen | character_outside_cast | entity_gap
+    scene_id: str
+    entity_kind: str   # character | prop
+    entity_id: str
+    shot_ids: Tuple[str, ...]
+    message: str
+
+
+def check_presence_and_continuity(
+    shots: List[ShotRef],
+    scene_casts: Iterable[SceneCast] = (),
+) -> List[ContinuityWarning]:
+    """在场性 + 跨镜连续性 lint（纯函数, 输入输出全是数据）。
+
+    三项检查（全部 warning 级）:
+    1. cast_member_never_on_screen: 场景角色表声明了角色, 但该场景没有任何
+       一镜让它到场（声明了却没落实——"不在场"必须如实记录, 不能只停在表里）。
+    2. character_outside_cast: 镜头引用了角色表之外的角色（表缺失时跳过）。
+    3. entity_gap: 同一场景内角色/道具"出现→消失→又出现", 中段消失的镜头
+       即瞬移/蒸发嫌疑（道具跨镜连续性是重灾区: "四镜都出现的一支笔和一件
+       外套是同一类问题"）。
+
+    场内排序: 时间码全齐按 (start_s, end_s, 输入序), 否则按输入序。
+    输出按 (scene_id, kind, entity_id) 排序, 保证同输入同输出（可快照测试）。
+    """
+    warnings: List[ContinuityWarning] = []
+
+    by_scene: Dict[str, List[ShotRef]] = {}
+    for shot in shots:
+        by_scene.setdefault(shot.scene_id, []).append(shot)
+
+    cast_map: Dict[str, Tuple[str, ...]] = {
+        cast.scene_id: tuple(cast.character_ids) for cast in scene_casts
+    }
+
+    # 1) 声明了却从未在场
+    for scene_id, declared in cast_map.items():
+        on_screen: set = set()
+        for shot in by_scene.get(scene_id, []):
+            on_screen.update(shot.character_ids)
+        for cid in declared:
+            if cid not in on_screen:
+                warnings.append(ContinuityWarning(
+                    kind="cast_member_never_on_screen",
+                    scene_id=scene_id,
+                    entity_kind="character",
+                    entity_id=cid,
+                    shot_ids=(),
+                    message=f"角色 {cid} 在场景 {scene_id} 角色表中，但该场景没有任何镜头让它到场",
+                ))
+
+    for scene_id, scene_shots in by_scene.items():
+        indexed = list(enumerate(scene_shots))
+        if all(s.start_s is not None and s.end_s is not None for s in scene_shots):
+            ordered = [s for _, s in sorted(indexed, key=lambda p: (p[1].start_s, p[1].end_s, p[0]))]
+        else:
+            ordered = [s for _, s in sorted(indexed, key=lambda p: p[0])]
+
+        # 2) 场外角色
+        declared = cast_map.get(scene_id)
+        if declared is not None:
+            declared_set = set(declared)
+            for shot in ordered:
+                for cid in shot.character_ids:
+                    if cid not in declared_set:
+                        warnings.append(ContinuityWarning(
+                            kind="character_outside_cast",
+                            scene_id=scene_id,
+                            entity_kind="character",
+                            entity_id=cid,
+                            shot_ids=(shot.shot_id,),
+                            message=f"镜头 {shot.shot_id} 引用角色 {cid}，但其不在场景 {scene_id} 角色表",
+                        ))
+
+        # 3) 出现→消失→又出现
+        for kind_name, attr in (("character", "character_ids"), ("prop", "prop_ids")):
+            presence: Dict[str, List[int]] = {}
+            for idx, shot in enumerate(ordered):
+                for eid in getattr(shot, attr):
+                    presence.setdefault(eid, []).append(idx)
+            for eid, idxs in presence.items():
+                if len(idxs) < 2:
+                    continue
+                idx_set = set(idxs)
+                first, last = idxs[0], idxs[-1]
+                missing = [ordered[i].shot_id for i in range(first + 1, last) if i not in idx_set]
+                if missing:
+                    noun = "角色" if kind_name == "character" else "道具"
+                    warnings.append(ContinuityWarning(
+                        kind="entity_gap",
+                        scene_id=scene_id,
+                        entity_kind=kind_name,
+                        entity_id=eid,
+                        shot_ids=tuple(missing),
+                        message=(
+                            f"{noun} {eid} 在场景 {scene_id} 中段消失于镜头 "
+                            f"{'、'.join(missing)} 后又出现——疑似镜外瞬移/蒸发，"
+                            f"需在分镜中交代离场与回归依据"
+                        ),
+                    ))
+
+    warnings.sort(key=lambda w: (w.scene_id, w.kind, w.entity_id))
+    return warnings
