@@ -201,6 +201,8 @@ DEFAULT_STORYBOARD_POLISH_PROMPT = """
 
 【风格一致性】全片必须保持同一美术风格。若已选定风格（如高清电影写实 / 新海诚式光影），用风格词锁定，禁止混入其他风格元素。
 
+@@CONTINUITY_CHECKLIST@@
+
 # 输出格式
 严格返回一个 JSON 对象：
 {{
@@ -292,6 +294,7 @@ slot，因此 :name 后缀不会干扰——它只是补充可见的上下文。
 6. **锚点逐字复述**：角色的外观锚点（发型、服装、显著特征）必须从参考素材描述中逐字复述，不得改写、不得省略后即兴补充。角色一致性是第一优先级，宁可不加新细节，也不能让同一角色的外观在镜头间漂移。
 7. **动作幅度分级**：每个动作写明幅度档位（slight/slowly/uniform/obvious），默认 slight 或 slowly，禁止 violent/fast。一个镜头只承载一个主动作。
 8. **风格一致**：保持与参考素材相同的画风与色调，不混入其他风格元素。
+9. **跨镜连续**：若项目存在相邻镜头，保持轴线（屏幕方向）、站位、视线、持物四类连续——剧本明确写出转向/交接理由时才允许变化；上一镜的终点状态是本镜可信起点。
 
 # 输出格式
 严格返回一个 JSON 对象：
@@ -308,6 +311,83 @@ SLOTS：character1 = "White rabbit / 小兔子", character2 = "Robot dog / 机�
 {{
     "prompt_cn": "[character1:小兔子] 从门里猛然跳出，落地时耳朵竖起，充满活力。房间昏暗，温暖的光线从尘土飞扬的窗户中透入。[character1:小兔子] 兴奋地环顾四周说道：'我正好赶上了！' 镜头随着跳跃略微倾斜。",
     "prompt_en": "[character1:White rabbit] bursts through the door with an exaggerated jump, landing energetically with ears perked up. The room is dimly lit with warm ambient light streaming through dusty windows. [character1:White rabbit] looks around excitedly and says: 'I made it just in time!' Camera follows the jump with a slight tilt."
+}}""".strip()
+
+
+# ── 跨镜连续性检查清单（四类：轴线/站位/视线/持物） ────────────────────────
+# 方法论来源：zenstory-ai/drama-skills skills/short-drama-storyboard（MIT License），
+# 见 https://github.com/zenstory-ai/drama-skills 。仅提炼其连续性规范语义重写为
+# 中文检查项（只抄规范、不 vendor 代码）：相邻镜头的站位/朝向/视线/持物/伤势/光态
+# 连续；复杂群戏先锁空间锚点和屏幕方向；持物交接写接触者与落点，禁止镜外瞬移衔接。
+# 通过 @@CONTINUITY_CHECKLIST@@ 占位（同 @@SHOT_SIZES@@ 的模块级 replace 做法）
+# 注入 DEFAULT_STORYBOARD_POLISH_PROMPT，清单常量同时导出供质检/测试复用。
+CONTINUITY_CHECKLIST = (
+    ("轴线", "同一场景锁定空间锚点与屏幕方向，机位不越 180° 轴线，"
+             "人物左右关系与进出场方向不得无故翻转"),
+    ("站位", "人物相对位置与进出画方向逐镜衔接，上一镜终点站位是下一镜可信起点，"
+             "禁止镜外瞬移"),
+    ("视线", "谁的目光落在谁/什么身上逐镜可追溯，视线方向与对方实际方位一致，"
+             "对视与回避不得和站位矛盾"),
+    ("持物", "手持物件跨镜保持同一侧同一状态（伤势、光态等状态物同理），"
+             "交接/换手/放置写明接触者与落点，物件不凭空出现或消失"),
+)
+
+
+def format_continuity_checklist_block() -> str:
+    """把四类连续性清单格式化为注入 prompt 的导演铁律块。"""
+    lines = [f"- {cat}：{req}；" for cat, req in CONTINUITY_CHECKLIST]
+    return (
+        "【跨镜连续性】多镜头任务必须逐项自查以下四类连续性，"
+        "除非剧本明确写出转向/交接理由：\n" + "\n".join(lines)
+    )
+
+
+# 质检评审 prompt（导出待接线：后续 VLM/LLM 质检工位直接引用，当前不接调用链）。
+# 方法论来源：zenstory-ai/drama-skills skills/short-drama-review/SKILL.md（MIT License），
+# 仅提炼评审规范要点（冻结范围→可证明事实→带证据 finding→跨文档综合→结论分级），
+# 不 vendor 原文。花括号按惯例写成 {{}} 以兼容未来 .format 注入。
+DEFAULT_QA_REVIEW_PROMPT = """# 角色
+你是短剧分镜/成片的质检评审员（独立 reviewer 视角）。你只输出审查结论与修订要求，不代替创作者改稿。
+
+# 工作流
+1. **冻结范围**：先写清本次审查哪些镜头/场次/提示词；审查中范围发生变化时，重读材料再下结论。
+2. **先查可证明事实**（机器可核对的结构事实）：
+   - 镜号与引用 ID 是否唯一且可解析；每镜时长是否为正数、与声明总时长是否一致；
+   - 对白、动作、声音、画面文字是否都有镜头承载，或有明确的省略理由；
+   - 相邻镜头的站位、朝向、视线、持物、伤势、光态与可读文字是否连续；
+   - 起点与终点是否写绝对事实（禁止"同上""保持不变"代替）；
+   - 提示词是否从准确起点到准确终点；有无凭据/绝对路径/内部流程文字泄漏。
+3. **带证据审内容**：每个 finding 必须包含——位置、必要短引文或冲突事实、观众/制作影响、
+   必须达到的修订结果、严重程度。禁止只给"AI 味""不够电影感"这类无证据评语，禁止无证据打分。
+4. **跨文档综合**：剧本事实 → 视觉设定 → 镜头职责与边界 → 冻结关键帧 → 视频运动 → 下一状态。
+   优先守住原意、观众知情时机与连续性，不奖励脱离来源的华丽提示词。
+
+# 严重程度
+- blocker：不安全、不可交付或会让流程走错；
+- major：明显破坏剧情理解、连续性或制作结果；
+- minor：有具体影响但不阻断；
+- note：创作选择或可选润色。
+
+# 结论
+- APPROVE：没有阻断问题；
+- APPROVE_WITH_NOTES：只有不阻断的改进；
+- REVISE：存在结构、内容或限制冲突；
+- PROVISIONAL：关键输入不足，暂时无法完成判断。
+
+# 输出格式
+严格返回一个 JSON 对象：
+{{
+    "verdict": "APPROVE | APPROVE_WITH_NOTES | REVISE | PROVISIONAL",
+    "findings": [
+        {{
+            "id": "REV-001",
+            "severity": "blocker | major | minor | note",
+            "location": "文件/镜头 ID 或行号",
+            "evidence": "短引文或冲突事实",
+            "impact": "对观众/制作的影响",
+            "required_fix": "必须达到的修订结果"
+        }}
+    ]
 }}""".strip()
 
 
@@ -472,6 +552,11 @@ DEFAULT_STORYBOARD_EXTRACTION_PROMPT = (
     DEFAULT_STORYBOARD_EXTRACTION_PROMPT
     .replace("@@SHOT_SIZES@@", " | ".join(e.value for e in ShotSizeEnum))
     .replace("@@CAMERA_ANGLES@@", " | ".join(e.value for e in CameraAngleEnum))
+)
+
+# 四类连续性清单注入分镜润色 prompt（清单常量 = 唯一来源，测试防误删）
+DEFAULT_STORYBOARD_POLISH_PROMPT = DEFAULT_STORYBOARD_POLISH_PROMPT.replace(
+    "@@CONTINUITY_CHECKLIST@@", format_continuity_checklist_block()
 )
 
 
