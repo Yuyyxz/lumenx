@@ -8,6 +8,7 @@ import subprocess
 import threading
 import platform
 from urllib.parse import quote
+from pydantic import BaseModel
 from .models import Script, GenerationStatus, VideoTask, Character, Scene, StoryboardFrame, Series, PromptConfig, ArtDirection, GlobalAssetLibrary
 from .llm import ScriptProcessor
 from .assets import AssetGenerator
@@ -21,6 +22,19 @@ from ...utils.provider_registry import resolve_provider_backend
 from ...utils.system_check import get_ffmpeg_path, get_ffmpeg_install_instructions
 
 logger = get_logger(__name__)
+
+
+def _unwrap_optional(annotation: Any) -> Any:
+    """Optional[X] → X（无参/非 Optional 原样返回）。用于通用 patch 的
+    dict → pydantic 子模型收口（T-B6 三分离卡字段）。"""
+    import typing
+    args = typing.get_args(annotation)
+    if not args:
+        return annotation
+    for arg in args:
+        if arg is not type(None):
+            return arg
+    return annotation
 
 # --- Security helpers ---
 
@@ -1156,6 +1170,13 @@ class ComicGenPipeline:
         # Update attributes
         for key, value in attributes.items():
             if hasattr(target_asset, key):
+                # T-B6：dict → 字段声明的 pydantic 子模型收口（如 image_card /
+                # persona_profile），否则活对象字段是裸 dict，要到下次重载才纠正。
+                current = getattr(target_asset, key, None)
+                if isinstance(value, dict) and not isinstance(current, BaseModel):
+                    inner = _unwrap_optional(type(target_asset).model_fields[key].annotation)
+                    if isinstance(inner, type) and issubclass(inner, BaseModel):
+                        value = inner.model_validate(value)
                 setattr(target_asset, key, value)
             else:
                 logger.warning(f"Attribute {key} not found in {asset_type} model")
